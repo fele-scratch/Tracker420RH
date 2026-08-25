@@ -1,0 +1,10 @@
+.env
+*.env
+node_modules/
+audit/*.json
+github_pat.txt
+*.key
+*.pem
+audit/*.json
+audit/missed/
+audit/*.mjs
