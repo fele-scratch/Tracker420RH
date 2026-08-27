@@ -1,5 +1,6 @@
 import "dotenv/config";
 import WebSocket from "ws";
+import { buildGmgnUnsignedBuy } from "./gmgn-buy.js";
 import { extractAddressCandidates, extractPonsLaunchTokenCandidates, extractTraceAddresses, extractZeroAddressMints, hasLaunchEvidence, selector } from "./launch-analysis.js";
 
 const HTTP = must("RPC_HTTP_URL");
@@ -7,9 +8,12 @@ const WS = must("RPC_WS_URL");
 const MOTHERSHIP = address(process.env.MOTHERSHIP_ADDRESS ?? "0x6bed168687c1bca3466f1f3fb188c2dd058f4597");
 const BUNDLE_TOPIC = process.env.BUNDLE_CREATED_TOPIC?.toLowerCase();
 const CANDIDATE_TTL_MS = Number(process.env.CANDIDATE_TTL_MS ?? 900_000);
-const RECONCILE_INTERVAL_MS = Number(process.env.RECONCILE_INTERVAL_MS ?? 15_000);
 const BUY_ENABLED = process.env.BUY_ENABLED === "true";
-const ENABLE_BLOCK_RECONCILIATION = process.env.ENABLE_BLOCK_RECONCILIATION === "true";
+const BUY_RECIPIENT = process.env.BUY_RECIPIENT ? address(process.env.BUY_RECIPIENT) : null;
+const BUY_AMOUNT_WEI = parsePositiveBigInt(process.env.BUY_AMOUNT_WEI, 800_000_000_000_000n);
+const GMGN_API_KEY = process.env.GMGN_API_KEY;
+const BUY_EXECUTION_MODE = process.env.BUY_EXECUTION_MODE ?? "gmgn_unsigned_tx";
+const GMGN_SLIPPAGE_PERCENT = Number(process.env.GMGN_SLIPPAGE_PERCENT ?? "15");
 
 type RpcResponse<T> = { result?: T; error?: { code: number; message: string } };
 type Tx = { hash: string; from: string; to: string | null; input: string; blockNumber?: string; transactionIndex?: string };
@@ -19,13 +23,18 @@ type Candidate = { wallet: string; firstSeenBlock: bigint; expiresAt: number; so
 
 const candidates = new Map<string, Candidate>();
 let refreshCandidateSubscriptions: (() => void) | null = null;
-const processedBlocks = new Set<string>();
-let lastReconciled = -1n;
 
 function must(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`Missing ${name}`);
   return value;
+}
+
+function parsePositiveBigInt(value: string | undefined, fallback: bigint): bigint {
+  if (value === undefined || value === "") return fallback;
+  const parsed = BigInt(value);
+  if (parsed <= 0n) throw new Error(`Invalid positive integer: ${value}`);
+  return parsed;
 }
 
 function address(value: string): string {
@@ -35,6 +44,10 @@ function address(value: string): string {
 
 function log(message: string, data: Record<string, unknown> = {}): void {
   console.log(JSON.stringify({ at: new Date().toISOString(), message, ...data }));
+}
+
+function safeEndpoint(endpoint: string): string {
+  return endpoint.replace(/(\/v2\/)[^/?]+/, "$1***");
 }
 
 async function rpc<T>(method: string, params: unknown[]): Promise<T> {
@@ -79,6 +92,14 @@ async function getTrace(hash: string): Promise<unknown | null> {
   return null;
 }
 
+async function prepareBuyPlan(tokenAddress: string, launchTx: Tx): Promise<Record<string, unknown>> {
+  if (!BUY_RECIPIENT) throw new Error("BUY_RECIPIENT is required for BUY plan generation");
+  if (BUY_EXECUTION_MODE !== "gmgn_unsigned_tx") throw new Error("gmgn_submit is not implemented; broadcasting remains disabled");
+  if (!GMGN_API_KEY) throw new Error("GMGN_API_KEY is required for BUY plan generation");
+  const plan = await buildGmgnUnsignedBuy({ apiKey: GMGN_API_KEY, tokenAddress, recipient: BUY_RECIPIENT, amountInWei: BUY_AMOUNT_WEI, slippagePercent: GMGN_SLIPPAGE_PERCENT });
+  return { ...plan, launchTransaction: launchTx.hash, signed: false, broadcast: false };
+}
+
 function discoverCandidate(wallet: string, block: bigint, sourceTx: string): void {
   const key = wallet.toLowerCase();
   candidates.set(key, {
@@ -118,6 +139,20 @@ async function inspectWalletTransaction(tx: Tx): Promise<void> {
   }
   if (validTokens.length === 0) return;
 
+  let buyPlan: Record<string, unknown> | undefined;
+  if (BUY_RECIPIENT) {
+    const tokenAddress = validTokens.find((token) => zeroMintTokens.includes(token) || ponsEventTokens.includes(token));
+    if (!tokenAddress) {
+      log("BUY_PLAN_UNAVAILABLE", { reason: "launch receipt did not expose a validated token", launchTx: tx.hash });
+    } else {
+      try {
+        buyPlan = await prepareBuyPlan(tokenAddress, tx);
+      } catch (error) {
+        log("BUY_PLAN_UNAVAILABLE", { reason: String(error), launchTx: tx.hash, tokenAddress });
+      }
+    }
+  }
+
   log("LAUNCH_DETECTED", {
     wallet,
     sourcePreparationTx: candidate.sourceTx,
@@ -135,6 +170,7 @@ async function inspectWalletTransaction(tx: Tx): Promise<void> {
       traceAvailable: trace !== null,
     },
     buyEnabled: BUY_ENABLED,
+    buyPlan,
     action: BUY_ENABLED ? "EXECUTION_NOT_IMPLEMENTED" : "DRY_RUN_ONLY",
   });
 
@@ -143,30 +179,15 @@ async function inspectWalletTransaction(tx: Tx): Promise<void> {
   refreshCandidateSubscriptions?.();
 }
 
-async function processBlock(blockHex: string): Promise<void> {
-  const blockNumber = BigInt(blockHex);
-  const key = blockNumber.toString();
-  if (processedBlocks.has(key)) return;
-  processedBlocks.add(key);
-  if (processedBlocks.size > 5_000) processedBlocks.delete(processedBlocks.values().next().value as string);
-
-  const block = await rpc<{ transactions: Tx[] } | null>("eth_getBlockByNumber", [blockHex, true]);
-  if (!block) return;
-  for (const tx of block.transactions ?? []) {
-    if (!tx.from) continue;
-    const wallet = tx.from.toLowerCase();
-    if (candidates.has(wallet)) {
-      await inspectWalletTransaction({ ...tx, blockNumber: tx.blockNumber ?? blockHex });
-    }
-  }
-}
-
-async function handleBundleLog(item: Log): Promise<void> {
-  if (!BUNDLE_TOPIC || item.topics?.[0]?.toLowerCase() !== BUNDLE_TOPIC) return;
-  const tx = await rpc<Tx>("eth_getTransactionByHash", [item.transactionHash]);
-  if (!tx?.from) return;
-  const block = BigInt(item.blockNumber);
-  discoverCandidate(tx.from, block, item.transactionHash);
+async function handleMothershipTransaction(tx: Tx): Promise<void> {
+  if (!BUNDLE_TOPIC || tx.to?.toLowerCase() !== MOTHERSHIP) return;
+  if (!tx.blockNumber) return;
+  const receipt = await getReceipt(tx.hash);
+  const bundleLog = receipt.logs?.find((item) =>
+    item.address.toLowerCase() === MOTHERSHIP && item.topics?.[0]?.toLowerCase() === BUNDLE_TOPIC,
+  );
+  if (!bundleLog) return;
+  discoverCandidate(tx.from, BigInt(tx.blockNumber), tx.hash);
 }
 
 function connect(): void {
@@ -175,7 +196,8 @@ function connect(): void {
   let socketReady = false;
   let candidateMiningSubscriptionId: string | null = null;
   let candidateMiningRequestId: number | null = null;
-  const subscriptions = new Map<number, string>();
+  let mothershipMiningSubscriptionId: string | null = null;
+  let mothershipMiningRequestId: number | null = null;
 
   const syncCandidateMiningSubscription = (): void => {
     if (!socketReady) return;
@@ -207,15 +229,18 @@ function connect(): void {
 
   socket.on("open", () => {
     socketReady = true;
-    log("WS_CONNECTED", { endpoint: WS.replace(/\/\/.*@/, "//***@") });
-    const bundleFilter = {
-      address: MOTHERSHIP,
-      ...(BUNDLE_TOPIC ? { topics: [BUNDLE_TOPIC] } : {}),
-    };
-    socket.send(JSON.stringify({ jsonrpc: "2.0", id: nextId++, method: "eth_subscribe", params: ["logs", bundleFilter] }));
-    if (ENABLE_BLOCK_RECONCILIATION) {
-      socket.send(JSON.stringify({ jsonrpc: "2.0", id: nextId++, method: "eth_subscribe", params: ["newHeads"] }));
-    }
+    log("WS_CONNECTED", { endpoint: safeEndpoint(WS) });
+    mothershipMiningRequestId = nextId++;
+    socket.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: mothershipMiningRequestId,
+      method: "eth_subscribe",
+      params: ["alchemy_minedTransactions", {
+        addresses: [{ to: MOTHERSHIP }],
+        includeRemoved: false,
+        hashesOnly: false,
+      }],
+    }));
     refreshCandidateSubscriptions = syncCandidateMiningSubscription;
     syncCandidateMiningSubscription();
   });
@@ -226,22 +251,28 @@ function connect(): void {
         id?: number;
         result?: string | boolean;
         error?: { code: number; message: string };
-        params?: { subscription: string; result: Log | { number: string } | { removed: boolean; transaction: Tx } };
+        params?: { subscription: string; result: Tx | { removed: boolean; transaction: Tx } };
       };
       if (message.error) {
         log("WS_RPC_ERROR", { error: message.error });
         return;
       }
       if (message.id && typeof message.result === "string") {
-        subscriptions.set(message.id, message.result);
         if (message.id === candidateMiningRequestId) candidateMiningSubscriptionId = message.result;
+        if (message.id === mothershipMiningRequestId) mothershipMiningSubscriptionId = message.result;
+        log("WS_SUBSCRIPTION_ACCEPTED", {
+          requestId: message.id,
+          subscription: message.result,
+          stream: message.id === candidateMiningRequestId ? "candidate-wallets" :
+            message.id === mothershipMiningRequestId ? "mothership-to-filter" : "other",
+        });
         return;
       }
       const result = message.params?.result;
       if (!result) return;
-      if ("topics" in result) await handleBundleLog(result as Log);
-      else if ("number" in result) await processBlock(result.number);
-      else if ("transaction" in result) {
+      if (message.params?.subscription === mothershipMiningSubscriptionId) {
+        await handleMothershipTransaction(result as unknown as Tx);
+      } else if ("transaction" in result) {
         const mined = result as { removed: boolean; transaction: Tx };
         if (!mined.removed) await inspectWalletTransaction(mined.transaction);
       }
@@ -255,26 +286,11 @@ function connect(): void {
     socketReady = false;
     candidateMiningSubscriptionId = null;
     candidateMiningRequestId = null;
+    mothershipMiningSubscriptionId = null;
+    mothershipMiningRequestId = null;
     log("WS_CLOSED_RECONNECTING");
     setTimeout(connect, 1_000);
   });
-}
-
-async function reconcile(): Promise<void> {
-  try {
-    const latestHex = await rpc<string>("eth_blockNumber", []);
-    const latest = BigInt(latestHex);
-    if (lastReconciled < 0n) lastReconciled = latest - 3n;
-    for (let block = lastReconciled + 1n; block <= latest; block++) {
-      await processBlock(`0x${block.toString(16)}`);
-    }
-    lastReconciled = latest;
-    for (const [wallet, candidate] of candidates) {
-      if (candidate.expiresAt < Date.now()) candidates.delete(wallet);
-    }
-  } catch (error) {
-    log("RECONCILE_ERROR", { error: String(error) });
-  }
 }
 
 log("STARTING", {
@@ -283,10 +299,6 @@ log("STARTING", {
   buyEnabled: BUY_ENABLED,
   mode: BUY_ENABLED ? "guarded execution placeholder" : "dry-run detection",
   candidateMonitoring: "Alchemy alchemy_minedTransactions address-filtered WebSocket",
-  blockReconciliation: ENABLE_BLOCK_RECONCILIATION,
+  mothershipMonitoring: "Alchemy alchemy_minedTransactions to-filtered WebSocket",
 });
 connect();
-if (ENABLE_BLOCK_RECONCILIATION) {
-  void reconcile();
-  setInterval(() => void reconcile(), RECONCILE_INTERVAL_MS);
-}

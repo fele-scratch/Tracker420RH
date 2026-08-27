@@ -1,61 +1,89 @@
 # Tracker420RH
 
-**Tracker420RH is a live, real-time Robinhood Chain launch listener.** Its job is to watch the `0x6bed` Pons V2 mothership, identify the wallet behind a preparation or bundle transaction, immediately begin listening to that wallet, recognize the wallet’s launch transaction, identify the token contract, and emit `LAUNCH_DETECTED` as soon as launch evidence is available.
+Tracker420RH is a real-time Robinhood Chain listener. It watches the Pons V2 mothership, identifies wallets that initiate qualifying bundle interactions, follows those wallets for their next mined transactions, reports verified token launches, and can prepare a GMGN-routed unsigned BUY plan.
 
-This is a **streaming bot**, not a block-scanning bot. The primary path uses persistent JSON-RPC WebSocket subscriptions so new mothership events and candidate-wallet transactions are delivered as they occur. The bot does not wait for a loop to pull every block from the last checkpoint before it can react.
+The production listener uses two address-filtered `alchemy_minedTransactions` subscriptions:
 
-## Live streaming architecture
+1. A `to`-filtered subscription for the monitored mothership contract.
+2. A `from`-filtered subscription that is rebuilt for currently active candidate wallets.
 
-Robinhood Chain is EVM-compatible. Tracker420RH uses EVM `eth_subscribe` over a compatible WebSocket endpoint. Solana’s `logsSubscribe` method is not used here.
+## Production flow
 
-The bot maintains two live streams:
+### 1. Watch the mothership
 
-| Stream | Purpose |
-|---|---|
-| Mothership log stream | Watches `0x6bed168687c1bca3466f1f3fb188c2dd058f4597` for the configured bundle/preparation event topic. |
-| Candidate-wallet mined-transaction stream | Dynamically subscribes to each discovered wallet with Alchemy’s address-filtered `alchemy_minedTransactions` subscription using `{ from: candidateWallet }`. |
+On each WebSocket connection, the bot subscribes to mined transactions sent to the configured mothership, which defaults to:
 
-When a mothership event arrives, Tracker420RH resolves the outer transaction sender and immediately adds that wallet to the candidate set. The wallet subscription is then refreshed so the wallet’s next mined transaction can be inspected directly, without waiting for a block-by-block catch-up process.
+```text
+0x6bed168687c1bca3466f1f3fb188c2dd058f4597
+```
 
-## Launch detection
+The request uses `alchemy_minedTransactions` with `addresses: [{ to: MOTHERSHIP_ADDRESS }]`, `includeRemoved: false`, and `hashesOnly: false`. This filter receives only mined transactions addressed to the mothership. Testing on Robinhood Chain with a high-activity contract delivered real transaction notifications through this filter.
 
-The developer’s subsequent buy is **not required**. A candidate transaction is considered launch evidence only when it is successful and the token can be identified from reliable execution evidence. The detector currently checks:
+### 2. Validate the bundle interaction
+
+For each mothership transaction notification, the bot fetches that transaction's receipt with `eth_getTransactionReceipt`. It accepts the transaction for candidate discovery only when the receipt contains a log that was emitted by the configured mothership address and whose first topic is the configured `BUNDLE_CREATED_TOPIC`.
+
+The transaction's `from` address is the initiating wallet. The bot uses the transaction hash as the candidate's source preparation transaction and the transaction block number as its first-seen block metadata.
+
+### 3. Register the candidate wallet
+
+The initiating wallet is normalized to lowercase and stored with its wallet address, source preparation transaction hash, first-seen block number, and an expiration time based on `CANDIDATE_TTL_MS`. Registering or refreshing a candidate immediately rebuilds the wallet subscription.
+
+### 4. Subscribe to candidate wallets
+
+The bot subscribes to active candidate wallets with the same verified mined-transaction method, filtering by sender:
+
+```json
+{
+  "method": "eth_subscribe",
+  "params": [
+    "alchemy_minedTransactions",
+    {
+      "addresses": [{ "from": "DISCOVERED_WALLET" }],
+      "includeRemoved": false,
+      "hashesOnly": false
+    }
+  ]
+}
+```
+
+When the candidate set changes, the previous candidate subscription is removed and replaced with a subscription containing the current wallet set. At most 1,000 wallets are included in one request; the bot logs when the candidate set exceeds that limit.
+
+### 5. Receive and inspect wallet transactions
+
+A candidate notification marked `removed` is ignored. For each remaining notification, the bot fetches the receipt for that transaction hash and requires receipt status `0x1`. It then attempts `trace_transaction` and `debug_traceTransaction`, treating traces as optional, and extracts token candidates from the receipt and any available trace data.
+
+The HTTP RPC endpoint is used only for targeted lookups after filtered notifications: receipts, optional traces, deployed bytecode, and token metadata calls. The bot does not fetch blocks or scan unrelated transactions.
+
+### 6. Identify and validate the token
+
+The existing launch analysis checks these evidence paths:
 
 - a direct contract-creation address in the receipt;
 - an ERC-20 `Transfer` event minted from the zero address;
-- verified Pons launch-event payloads, including the observed `0x916d099c` path;
-- receipt-level token and factory events emitted by nested execution; and
-- optional recursive trace targets when the connected provider exposes transaction traces.
+- a configured Pons launch event containing an address candidate;
+- receipt log addresses and addresses encoded in log topics or data; and
+- recursive trace call or creation addresses when trace data is available.
 
-Known selectors such as `0x70237117`, `0x3c05c981`, and `0x916d099c` are classification hints only. A selector by itself cannot trigger a launch. The bot requires a successful receipt and an identified token contract before emitting `LAUNCH_DETECTED`.
+Known launch method selectors provide classification context. A selector alone is not enough to confirm a launch. The receipt must be successful and the analysis must identify a valid token candidate.
 
-The core sequence is:
+Generic token candidates must have deployed bytecode and respond successfully to at least one configured ERC-20 metadata or supply call. A token identified through a zero-address mint or the Pons launch event is trusted after bytecode validation.
 
-```text
-0x6bed preparation event
-        ↓
-outer transaction sender discovered
-        ↓
-wallet-specific WebSocket subscription created
-        ↓
-candidate wallet transaction arrives
-        ↓
-receipt, input, logs, and optional trace inspected
-        ↓
-actual token contract identified
-        ↓
-LAUNCH_DETECTED emitted immediately
-```
+### 7. Emit `LAUNCH_DETECTED`
 
-## Current execution mode
+The bot emits `LAUNCH_DETECTED` only after it has received a transaction from an active candidate wallet, confirmed a successful receipt, found launch evidence, and validated at least one token address.
 
-The repository is currently configured for safe detection and dry-run development. `BUY_ENABLED=false` is the default, and the listener contains no live signing or trading call. The simulated buy tests use an exact amount of `0.0008 ETH`, but they do not contact a router, sign a transaction, or broadcast anything.
+The event includes the candidate wallet, source preparation transaction, launch transaction, destination, selector, block metadata, token addresses, evidence details, and the current dry-run action state. After emission, the candidate wallet is removed and the wallet subscription is refreshed.
 
-Any future execution adapter must be reviewed separately for the selected Pons-only route, token filters, slippage limits, gas policy, nonce handling, retry policy, and signing method.
+## BUY planning
+
+When `BUY_RECIPIENT` is configured and a validated token is detected, the bot requests a route from GMGN for Robinhood Chain using native ETH as the input asset and the detected token as the output asset. It then submits the returned route to GMGN's documented simulation endpoint. A valid response must provide a complete transaction envelope including the route entry contract, calldata, value, chain ID, nonce, gas limit, and fee fields.
+
+The resulting plan is attached to `LAUNCH_DETECTED` as an unsigned transaction and validation report. The supported execution mode is `gmgn_unsigned_tx`; `gmgn_submit` is rejected. The bot never signs or broadcasts the result. GMGN route and simulation responses are used as returned; the bot does not construct a Pons-specific selector or assume a particular DEX route.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and provide a Robinhood Chain HTTP endpoint plus a compatible WebSocket endpoint:
+Copy the template and provide the required endpoints:
 
 ```bash
 cp .env.example .env
@@ -64,30 +92,45 @@ pnpm typecheck
 pnpm start
 ```
 
-The WebSocket provider must support the address-filtered `alchemy_minedTransactions` subscription. The public HTTP RPC endpoint is not used as the primary wallet listener. `ENABLE_BLOCK_RECONCILIATION=false` should remain disabled for the normal live streaming path; it exists only as an optional recovery mechanism for missed provider messages or reconnect gaps.
+Environment variables defined by the bot are:
 
-Do not commit `.env`, private keys, PATs, API keys, or raw credential-bearing files. GMGN is used for analysis and is not required by this listener core.
+| Variable | Required | Purpose |
+|---|---:|---|
+| `RPC_HTTP_URL` | Yes | HTTP JSON-RPC endpoint for targeted transaction, receipt, trace, bytecode, and token validation calls. |
+| `RPC_WS_URL` | Yes | WebSocket endpoint supporting address-filtered `alchemy_minedTransactions`. |
+| `MOTHERSHIP_ADDRESS` | No | Monitored contract. Defaults to the Pons V2 mothership address. |
+| `BUNDLE_CREATED_TOPIC` | No | Receipt log topic used to identify qualifying mothership interactions. Candidate discovery is disabled when unset. |
+| `CANDIDATE_TTL_MS` | No | Candidate lifetime in milliseconds. Defaults to `900000` (15 minutes). |
+| `BUY_ENABLED` | No | Safety flag. Defaults to `false`; signing and broadcasting remain disabled. |
+| `BUY_RECIPIENT` | No | Bot wallet that receives purchased tokens and is sent to GMGN as `from_address`. A BUY plan is omitted when unset. |
+| `BUY_AMOUNT_WEI` | No | Native ETH input amount. Defaults to `800000000000000` wei (`0.0008 ETH`). |
+| `BUY_EXECUTION_MODE` | No | `gmgn_unsigned_tx` is the only supported mode. Other modes fail closed. |
+| `GMGN_API_KEY` | Required for BUY planning | GMGN route API key, sent only as the `x-route-key` header. |
+| `GMGN_SLIPPAGE_PERCENT` | No | Slippage percentage passed to GMGN simulation. Defaults to `15`. |
+
+Do not place API keys, private keys, or credential-bearing files in source control. The bot redacts the credential portion of `/v2/<key>` WebSocket URLs in its connection log.
+
+## Current limitations
+
+- WebSocket reconnects are automatic after a connection closes, and subscriptions are recreated on the new connection.
+- A subscription acknowledgement confirms provider acceptance; it does not by itself prove transaction delivery.
+- Candidate wallets are held in process memory and expire after `CANDIDATE_TTL_MS`.
+- At most 1,000 candidate wallets are included in one candidate subscription refresh.
+- Receipt, bytecode, metadata, and trace calls depend on the configured HTTP provider. Trace support is optional; receipt evidence remains the primary analysis input.
+- The bot does not persist candidates or replay missed WebSocket notifications after a process restart.
+- `BUY_ENABLED=false` is the intended current mode. The bot detects launches and can produce an unsigned GMGN dry-run plan but does not sign or broadcast transactions.
+- BUY planning requires a configured recipient, `GMGN_API_KEY`, and a valid GMGN route/simulation response. The planner returns an unsigned transaction only; no signing or broadcasting is implemented.
+- A candidate wallet must be discovered before its wallet-specific subscription exists. Transactions before discovery or during a WebSocket outage may not be observed.
 
 ## Tests
 
-Run the complete local suite with:
+Run the typecheck and complete test suite:
 
 ```bash
+pnpm typecheck
 pnpm test
 ```
 
-Run only the fast dry-run buy simulation with:
+The tests cover launch-evidence extraction, candidate registration, filtered subscription request shape, failed transactions, direct creation, mint events, Pons launch payloads, and optional trace evidence. The historical replay test requires the corresponding JSON fixtures under `audit/`.
 
-```bash
-pnpm test:buy-dry-run
-```
-
-The tests cover synthetic mothership discovery, dynamic wallet registration, candidate-wallet launch detection, direct creation, zero-address minting, Pons event payloads, nested trace fixtures, failed transactions, missed-transaction regression cases, and the simulated `0.0008 ETH` buy/retry path.
-
-## Known provider limitation
-
-The streaming design is primary, but enhanced subscription support is provider-specific. A WebSocket handshake acknowledgement proves that the request was accepted; it does not by itself prove that every Robinhood Chain mined transaction will be delivered through the enhanced address filter. The listener therefore records subscription errors and reconnects automatically. If the provider does not deliver enhanced wallet notifications reliably, use a provider with confirmed Robinhood Chain support for this subscription type or add a second independent real-time wallet-activity feed. Block reconciliation must remain recovery-only, not the main detection mechanism.
-
-## Repository status
-
-This is the event-driven listener core for Tracker420RH. It is suitable for local dry-run testing and further integration work. It is not a live-money trading system until an execution adapter is deliberately implemented, tested, and enabled.
+The standalone research probe under `experimental/wallet-websocket-probe/` is not part of the production listener.

@@ -27,6 +27,19 @@ export function extractZeroAddressMints(receipt: LaunchReceipt): string[] {
   return [...tokens];
 }
 
+export function extractPonsInitialPoolCandidates(receipt: LaunchReceipt, tokenAddresses: string[] = extractZeroAddressMints(receipt)): string[] {
+  const tokens = new Set(tokenAddresses.map((address) => address.toLowerCase()));
+  const pools = new Set<string>();
+  for (const item of receipt.logs ?? []) {
+    if (!tokens.has(item.address.toLowerCase())) continue;
+    if (item.topics?.[0]?.toLowerCase() !== ERC20_TRANSFER_TOPIC) continue;
+    if (item.topics?.[1]?.toLowerCase() !== ZERO_TOPIC) continue;
+    const recipient = item.topics[2]?.slice(-40);
+    if (recipient && ADDRESS.test(`0x${recipient}`)) pools.add(`0x${recipient}`.toLowerCase());
+  }
+  return [...pools];
+}
+
 function addressesFromWord(word: string): string[] {
   if (!WORD.test(word)) return [];
   const hex = word.slice(2);

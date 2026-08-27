@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   extractAddressCandidates,
+  extractPonsInitialPoolCandidates,
   extractPonsLaunchTokenCandidates,
   extractTraceAddresses,
   extractZeroAddressMints,
@@ -44,6 +45,19 @@ test("covers a Pons launch whose token address is emitted in event data", () => 
     mothership: MOTHERSHIP,
     launchSelectors: new Set(["0x916d099c"]),
   }), true);
+});
+
+test("extracts the initial Pons pool from the token mint recipient", () => {
+  const pool = "0x4b07b154848c8d6473df57f0582c808923e1e020";
+  const receipt = {
+    status: "0x1",
+    logs: [{
+      address: TOKEN,
+      topics: [ERC20_TRANSFER_TOPIC, ZERO_TOPIC, word(pool)],
+      data: "0x01",
+    }],
+  };
+  assert.deepEqual(extractPonsInitialPoolCandidates(receipt, [TOKEN]), [pool]);
 });
 
 test("covers nested trace call targets when no mint event is emitted", () => {

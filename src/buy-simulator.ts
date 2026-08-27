@@ -1,4 +1,121 @@
 export const SIMULATED_BUY_AMOUNT_WEI = 800_000_000_000_000n; // 0.0008 ETH
+export const ROBINHOOD_CHAIN_ID = 4663;
+
+export type BuyRoute = {
+  chainId: number;
+  inputToken: string;
+  outputToken: string;
+  amountInWei: bigint;
+  minAmountOut: bigint;
+  recipient: string;
+  deadline: number;
+  to: string;
+  data: string;
+  valueWei: bigint;
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  nonce: number;
+  type?: "eip1559" | "legacy";
+};
+
+export type UnsignedBuyTransaction = {
+  chainId: number;
+  nonce: number;
+  to: string;
+  data: string;
+  value: bigint;
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+  type: "eip1559";
+};
+
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const CALLDATA = /^0x[0-9a-fA-F]+$/;
+export const PONS_BUY_SELECTOR = "0x59a87bc1";
+export type MinimumOutputPolicy = "zero" | "slippage";
+
+function requireAddress(name: string, value: string): string {
+  if (!ADDRESS.test(value)) throw new Error(`Invalid ${name}: ${value}`);
+  return value.toLowerCase();
+}
+
+function encodeUint256(value: bigint): string {
+  if (value < 0n || value >= 1n << 256n) throw new Error("uint256 value is out of range");
+  return value.toString(16).padStart(64, "0");
+}
+
+function encodeAddress(value: string): string {
+  return requireAddress("recipient", value).slice(2).padStart(64, "0");
+}
+
+export function encodePonsBuyCalldata(amountInWei: bigint, amountOutMinimum: bigint, recipient: string): string {
+  if (amountInWei <= 0n) throw new Error("Input amount must be positive");
+  if (amountOutMinimum < 0n) throw new Error("Minimum output cannot be negative");
+  return `${PONS_BUY_SELECTOR}${encodeUint256(amountInWei)}${encodeUint256(amountOutMinimum)}${encodeAddress(recipient)}`;
+}
+
+export function calculateMinimumOutput(policy: MinimumOutputPolicy, quotedAmountOut: bigint | undefined, slippageBps: bigint): bigint {
+  if (policy === "zero") return 0n;
+  if (quotedAmountOut === undefined || quotedAmountOut <= 0n) throw new Error("A positive quote is required for slippage policy");
+  if (slippageBps < 0n || slippageBps >= 10_000n) throw new Error("Slippage must be between 0 and 9999 basis points");
+  return (quotedAmountOut * (10_000n - slippageBps)) / 10_000n;
+}
+
+export function buildPonsBuyTransaction(
+  route: Omit<BuyRoute, "data" | "to" | "valueWei" | "amountInWei" | "minAmountOut" | "outputToken" | "recipient"> & {
+    poolAddress: string;
+    tokenAddress: string;
+    amountInWei: bigint;
+    amountOutMinimum: bigint;
+    recipient: string;
+  },
+  now = Math.floor(Date.now() / 1000),
+): UnsignedBuyTransaction {
+  const poolAddress = requireAddress("Pons pool", route.poolAddress);
+  const recipient = requireAddress("recipient", route.recipient);
+  const data = encodePonsBuyCalldata(route.amountInWei, route.amountOutMinimum, recipient);
+  return buildUnsignedBuyTransaction({
+    ...route,
+    outputToken: route.tokenAddress,
+    minAmountOut: route.amountOutMinimum,
+    to: poolAddress,
+    data,
+    valueWei: route.amountInWei,
+    recipient,
+  }, now);
+}
+
+export function buildUnsignedBuyTransaction(route: BuyRoute, now = Math.floor(Date.now() / 1000)): UnsignedBuyTransaction {
+  const outputToken = requireAddress("output token", route.outputToken);
+  requireAddress("input token", route.inputToken);
+  requireAddress("recipient", route.recipient);
+  const to = requireAddress("route entry contract", route.to);
+  if (route.chainId !== ROBINHOOD_CHAIN_ID) throw new Error(`Unsupported chain ID: ${route.chainId}`);
+  if (route.amountInWei <= 0n) throw new Error("Input amount must be positive");
+  if (route.minAmountOut < 0n) throw new Error("Minimum output cannot be negative");
+  if (route.valueWei !== route.amountInWei) throw new Error("Native input value must equal input amount");
+  if (route.deadline <= now) throw new Error("Route deadline has expired");
+  if (!CALLDATA.test(route.data) || route.data.length < 10) throw new Error("Route calldata is missing or invalid");
+  if (route.gasLimit <= 0n) throw new Error("Gas limit must be positive");
+  if (route.maxFeePerGas <= 0n || route.maxPriorityFeePerGas <= 0n) throw new Error("EIP-1559 fee fields must be positive");
+  if (route.maxPriorityFeePerGas > route.maxFeePerGas) throw new Error("Priority fee cannot exceed max fee");
+  if (!Number.isSafeInteger(route.nonce) || route.nonce < 0) throw new Error("Nonce must be a non-negative safe integer");
+  if (route.type === "legacy") throw new Error("Legacy fee transactions are not supported by this builder yet");
+
+  return {
+    chainId: ROBINHOOD_CHAIN_ID,
+    nonce: route.nonce,
+    to,
+    data: route.data,
+    value: route.valueWei,
+    gasLimit: route.gasLimit,
+    maxFeePerGas: route.maxFeePerGas,
+    maxPriorityFeePerGas: route.maxPriorityFeePerGas,
+    type: "eip1559",
+  };
+}
 
 export type BuyAttemptFixture = {
   accepted: boolean;
