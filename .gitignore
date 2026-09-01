@@ -1,6 +1,7 @@
 .env
 *.env
 node_modules/
+dist/
 audit/*.json
 github_pat.txt
 *.key
@@ -8,3 +9,4 @@ github_pat.txt
 audit/*.json
 audit/missed/
 audit/*.mjs
+GMGN_PRIVATE_KEY_FILE
