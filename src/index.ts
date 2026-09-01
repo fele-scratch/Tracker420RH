@@ -326,6 +326,7 @@ async function handleMothershipTransaction(tx: Tx): Promise<void> {
 
 async function handlePonsLaunchTransaction(tx: Tx): Promise<void> {
   if (tx.to?.toLowerCase() !== PONS_LAUNCH_ROUTER || selector(tx.input) !== LAUNCH_SELECTOR) return;
+  log("PONS_TX_RECEIVED", { launchTx: tx.hash });
   const decoded = decodeLaunchAndBuyArgs(tx.input, MIN_EXEMPTIONS, MAX_EXEMPTIONS);
   if (!decoded || !(await wasFundedByOkx(decoded.recipient))) return;
   const receipt = await getReceipt(tx.hash);
