@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
     "start": "tsx src/index.ts",
+    "start:production": "node dist/index.js",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/**/*.test.ts",
     "test:buy-dry-run": "tsx --test test/buy-simulator.test.ts"

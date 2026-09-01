@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import test from "node:test";
 import { buildGmgnUnsignedBuy } from "../src/gmgn-buy.js";
 import { buildPonsBuyTransaction, buildUnsignedBuyTransaction, calculateMinimumOutput, encodePonsBuyCalldata, PONS_BUY_SELECTOR, ROBINHOOD_CHAIN_ID, SIMULATED_BUY_AMOUNT_WEI, simulateFastBuy } from "../src/buy-simulator.js";
@@ -21,26 +22,40 @@ const ROUTE = {
   nonce: 7,
 } as const;
 
-test("maps a GMGN Robinhood route and simulation into an unsigned transaction", async () => {
+test("submits a signed GMGN Agent API Robinhood swap", async () => {
   const originalFetch = globalThis.fetch;
   const requests: Request[] = [];
+  const { privateKey } = crypto.generateKeyPairSync("ed25519");
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   globalThis.fetch = async (input, init) => {
     const request = new Request(input, init);
     requests.push(request);
-    if (request.method === "GET") {
-      return new Response(JSON.stringify({ code: 0, data: { chain_id: 4663, to: ROUTE.to, amount_in: SIMULATED_BUY_AMOUNT_WEI.toString(), amount_out: "1000", input_token_address: "0x0000000000000000000000000000000000000000", output_token_address: TOKEN, value: SIMULATED_BUY_AMOUNT_WEI.toString() } }), { status: 200 });
-    }
-    return new Response(JSON.stringify({ code: 0, data: { chainId: 4663, to: ROUTE.to, data: ROUTE.data, value: SIMULATED_BUY_AMOUNT_WEI.toString(), gas_limit: "250000", nonce: 7, max_fee_per_gas: "1000000000", max_priority_fee_per_gas: "100000000" } }), { status: 200 });
+    return new Response(JSON.stringify({ code: 0, data: { order_id: "test-order", status: "pending" } }), { status: 200 });
   };
   try {
-    const plan = await buildGmgnUnsignedBuy({ apiKey: "test-key", tokenAddress: TOKEN, recipient: ROUTE.recipient, amountInWei: SIMULATED_BUY_AMOUNT_WEI, slippagePercent: 15, apiBaseUrl: "https://gmgn.test" });
-    assert.equal(plan.transaction.chainId, 4663);
-    assert.equal(plan.transaction.to, ROUTE.to);
-    assert.equal(plan.transaction.value, SIMULATED_BUY_AMOUNT_WEI);
-    assert.equal(requests.length, 2);
-    assert.equal(requests[0].headers.get("x-route-key"), "test-key");
-    assert.match(requests[0].url, /token_in_chain=robinhood/);
-    assert.match(requests[0].url, /token_in_address=0x0000000000000000000000000000000000000000/);
+    const plan = await buildGmgnUnsignedBuy({ apiKey: "test-key", privateKeyPem, tokenAddress: TOKEN, recipient: ROUTE.recipient, amountInWei: SIMULATED_BUY_AMOUNT_WEI, slippagePercent: 15, apiBaseUrl: "https://gmgn.test" });
+    assert.equal(plan.mode, "gmgn_agent_swap");
+    assert.deepEqual(plan.response, { order_id: "test-order", status: "pending" });
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].method, "POST");
+    assert.equal(requests[0].headers.get("x-apikey"), "test-key");
+    assert.ok(requests[0].headers.get("x-signature"));
+    assert.match(requests[0].url, /\/v1\/trade\/swap\?/);
+    const body = await requests[0].clone().json() as Record<string, unknown>;
+    assert.deepEqual(body, { chain: "robinhood", from_address: ROUTE.recipient, input_token: "0x0000000000000000000000000000000000000000", output_token: TOKEN, input_amount: SIMULATED_BUY_AMOUNT_WEI.toString(), slippage: 15, is_anti_mev: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("accepts Ed25519 signing keys for GMGN API requests", async () => {
+  const originalFetch = globalThis.fetch;
+  const { privateKey } = crypto.generateKeyPairSync("ed25519");
+  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  globalThis.fetch = async () => new Response(JSON.stringify({ code: 0, data: { status: "submitted" } }), { status: 200 });
+  try {
+    const plan = await buildGmgnUnsignedBuy({ apiKey: "test-key", privateKeyPem, tokenAddress: TOKEN, recipient: ROUTE.recipient, amountInWei: SIMULATED_BUY_AMOUNT_WEI, slippagePercent: 15 });
+    assert.deepEqual(plan.response, { status: "submitted" });
   } finally {
     globalThis.fetch = originalFetch;
   }

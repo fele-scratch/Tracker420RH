@@ -1,0 +1,105 @@
+export const ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+export const ZERO_TOPIC = "0x" + "0".repeat(64);
+export const PONS_LAUNCH_EVENT_TOPIC = "0x15de155d60524b3ee39fdb5a912aa3e8014858ffc9915be9c0ffc18fae66b486";
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const WORD = /^0x[0-9a-fA-F]*$/;
+export function selector(input) {
+    return input.length >= 10 ? input.slice(0, 10).toLowerCase() : "0x";
+}
+export function isSuccessful(receipt) {
+    return receipt.status === "0x1";
+}
+export function extractZeroAddressMints(receipt) {
+    const tokens = new Set();
+    for (const item of receipt.logs ?? []) {
+        if (item.topics?.[0]?.toLowerCase() !== ERC20_TRANSFER_TOPIC)
+            continue;
+        if (item.topics?.[1]?.toLowerCase() !== ZERO_TOPIC)
+            continue;
+        if (ADDRESS.test(item.address))
+            tokens.add(item.address.toLowerCase());
+    }
+    return [...tokens];
+}
+export function extractPonsInitialPoolCandidates(receipt, tokenAddresses = extractZeroAddressMints(receipt)) {
+    const tokens = new Set(tokenAddresses.map((address) => address.toLowerCase()));
+    const pools = new Set();
+    for (const item of receipt.logs ?? []) {
+        if (!tokens.has(item.address.toLowerCase()))
+            continue;
+        if (item.topics?.[0]?.toLowerCase() !== ERC20_TRANSFER_TOPIC)
+            continue;
+        if (item.topics?.[1]?.toLowerCase() !== ZERO_TOPIC)
+            continue;
+        const recipient = item.topics[2]?.slice(-40);
+        if (recipient && ADDRESS.test(`0x${recipient}`))
+            pools.add(`0x${recipient}`.toLowerCase());
+    }
+    return [...pools];
+}
+function addressesFromWord(word) {
+    if (!WORD.test(word))
+        return [];
+    const hex = word.slice(2);
+    const result = [];
+    for (let offset = 0; offset + 64 <= hex.length; offset += 64) {
+        const chunk = hex.slice(offset, offset + 64);
+        const candidate = `0x${chunk.slice(24)}`;
+        if (ADDRESS.test(candidate) && candidate !== "0x" + "0".repeat(40))
+            result.push(candidate.toLowerCase());
+    }
+    return result;
+}
+export function extractPonsLaunchTokenCandidates(receipt) {
+    const tokens = new Set();
+    for (const item of receipt.logs ?? []) {
+        if (item.topics?.[0]?.toLowerCase() !== PONS_LAUNCH_EVENT_TOPIC)
+            continue;
+        const firstWord = (item.data ?? "").slice(0, 66);
+        for (const address of addressesFromWord(firstWord))
+            tokens.add(address);
+    }
+    return [...tokens];
+}
+export function extractAddressCandidates(receipt) {
+    const candidates = new Set();
+    if (receipt.contractAddress && ADDRESS.test(receipt.contractAddress))
+        candidates.add(receipt.contractAddress.toLowerCase());
+    for (const item of receipt.logs ?? []) {
+        if (ADDRESS.test(item.address))
+            candidates.add(item.address.toLowerCase());
+        for (const topic of item.topics ?? [])
+            for (const address of addressesFromWord(topic))
+                candidates.add(address);
+        for (const address of addressesFromWord(item.data ?? ""))
+            candidates.add(address);
+    }
+    return [...candidates];
+}
+export function extractTraceAddresses(trace) {
+    const addresses = new Set();
+    const visit = (frame) => {
+        if (frame.to && ADDRESS.test(frame.to))
+            addresses.add(frame.to.toLowerCase());
+        if (frame.result?.address && ADDRESS.test(frame.result.address))
+            addresses.add(frame.result.address.toLowerCase());
+        for (const child of frame.calls ?? [])
+            visit(child);
+    };
+    for (const frame of Array.isArray(trace) ? trace : trace ? [trace] : [])
+        visit(frame);
+    return [...addresses];
+}
+export function hasLaunchEvidence(receipt, trace, context) {
+    if (!isSuccessful(receipt))
+        return false;
+    if (extractZeroAddressMints(receipt).length > 0)
+        return true;
+    if (receipt.contractAddress)
+        return true;
+    if (extractTraceAddresses(trace).length > 0 && extractAddressCandidates(receipt).length > 0)
+        return true;
+    const destinationMatches = context?.destination && context.mothership && context.destination.toLowerCase() === context.mothership.toLowerCase();
+    const selectorMatches = context?.inputSelector && context.launchSelectors?.has(context.inputSelector.toLowerCase());
+    return Boolean(destinationMatches && selectorMatches && extractAddressCandidates(receipt).length > 0);
+}

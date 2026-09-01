@@ -9,8 +9,39 @@ export type TraceFrame = { type?: string; to?: string; result?: { address?: stri
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const WORD = /^0x[0-9a-fA-F]*$/;
 
+export type LaunchAndBuyArgs = { recipient: string; exemptions: string[] };
+
 export function selector(input: string): string {
   return input.length >= 10 ? input.slice(0, 10).toLowerCase() : "0x";
+}
+
+export function decodeLaunchAndBuyArgs(input: string, minExemptions = 25, maxExemptions = 32): LaunchAndBuyArgs | null {
+  if (selector(input) !== "0xf85f8e41" || !WORD.test(input)) return null;
+  const args = input.slice(10);
+  const word = (index: number): string | null => {
+    const value = args.slice(index * 64, index * 64 + 64);
+    return value.length === 64 ? value : null;
+  };
+  const recipientWord = word(5);
+  const exemptionsOffsetWord = word(6);
+  if (!recipientWord || !exemptionsOffsetWord) return null;
+  const recipient = `0x${recipientWord.slice(24)}`.toLowerCase();
+  if (!ADDRESS.test(recipient)) return null;
+  const exemptionsOffset = Number.parseInt(exemptionsOffsetWord, 16) * 2;
+  if (!Number.isSafeInteger(exemptionsOffset)) return null;
+  const countWord = args.slice(exemptionsOffset, exemptionsOffset + 64);
+  if (countWord.length !== 64) return null;
+  const count = Number.parseInt(countWord, 16);
+  if (!Number.isSafeInteger(count) || count < minExemptions || count > maxExemptions) return null;
+  const exemptions: string[] = [];
+  for (let index = 0; index < count; index++) {
+    const value = args.slice(exemptionsOffset + 64 + index * 64, exemptionsOffset + 128 + index * 64);
+    if (value.length !== 64) return null;
+    const address = `0x${value.slice(24)}`.toLowerCase();
+    if (!ADDRESS.test(address)) return null;
+    exemptions.push(address);
+  }
+  return { recipient, exemptions };
 }
 
 export function isSuccessful(receipt: LaunchReceipt): boolean {

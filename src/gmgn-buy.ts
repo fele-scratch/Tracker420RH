@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import dns from "node:dns";
 
 dns.setDefaultResultOrder("ipv4first");
@@ -12,6 +13,7 @@ type JsonObject = Record<string, unknown>;
 
 export type GmgnBuyRequest = {
   apiKey: string;
+  privateKeyPem: string;
   tokenAddress: string;
   recipient: string;
   amountInWei: bigint;
@@ -33,10 +35,8 @@ export type GmgnUnsignedTransaction = {
 };
 
 export type GmgnBuyPlan = {
-  mode: "gmgn_unsigned_tx";
-  route: JsonObject;
-  simulation: JsonObject;
-  transaction: GmgnUnsignedTransaction;
+  mode: "gmgn_agent_swap";
+  response: unknown;
 };
 
 function address(name: string, value: unknown): string {
@@ -47,6 +47,25 @@ function address(name: string, value: unknown): string {
 function object(value: unknown, name: string): JsonObject {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`GMGN response missing ${name}`);
   return value as JsonObject;
+}
+
+function authQuery(): { timestamp: number; client_id: string } {
+  return { timestamp: Math.floor(Date.now() / 1000), client_id: crypto.randomUUID() };
+}
+
+function signMessage(message: string, privateKeyPem: string): string {
+  const key = crypto.createPrivateKey(privateKeyPem.replace(/\\n/g, "\n"));
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw new Error("GMGN_PRIVATE_KEY must be the Ed25519 private key that matches the public key used to create GMGN_API_KEY. Do not use the Robinhood EVM wallet private key here.");
+  }
+  return crypto.sign(null, Buffer.from(message), key).toString("base64");
+}
+
+function signedMessage(path: string, query: Record<string, string | number>, body: string, timestamp: number): string {
+  const queryString = Object.keys(query).sort()
+    .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(String(query[key]))}`)
+    .join("&");
+  return `${path}:${queryString}:${body}:${timestamp}`;
 }
 
 function responseData(value: unknown): unknown {
@@ -113,32 +132,33 @@ export async function buildGmgnUnsignedBuy(request: GmgnBuyRequest): Promise<Gmg
   const tokenAddress = address("output token", request.tokenAddress);
   const recipient = address("recipient", request.recipient);
   if (!request.apiKey) throw new Error("GMGN_API_KEY is required");
+  if (!request.privateKeyPem) throw new Error("GMGN_PRIVATE_KEY is required for Agent API trading");
   if (request.amountInWei <= 0n) throw new Error("Buy amount must be positive");
   if (!Number.isFinite(request.slippagePercent) || request.slippagePercent < 0 || request.slippagePercent >= 100) throw new Error("Invalid GMGN slippage");
-  const base = (request.apiBaseUrl ?? "https://gmgn.ai").replace(/\/$/, "");
-  const headers = { "x-route-key": request.apiKey, accept: "application/json" };
-  const routeUrl = new URL(`${base}/defi/router/v1/tx/available_routes_exact_in`);
-  routeUrl.search = new URLSearchParams({
-    token_in_chain: ROBINHOOD_GMGN_CHAIN,
-    token_out_chain: ROBINHOOD_GMGN_CHAIN,
-    token_in_address: ROBINHOOD_NATIVE_TOKEN,
-    token_out_address: tokenAddress,
-    in_amount: request.amountInWei.toString(),
-  }).toString();
-  const routeResponse = await fetch(routeUrl, { headers });
-  if (!routeResponse.ok) throw new Error(`GMGN route HTTP ${routeResponse.status}`);
-  const routeBody = responseData(await routeResponse.json());
-  const routes = Array.isArray(routeBody) ? routeBody : (object(routeBody, "routes").routes ?? routeBody);
-  const route = Array.isArray(routes) ? routes[0] : routes;
-  const routeObject = object(route, "route");
-  const simulationResponse = await fetch(`${base}/defi/router/v1/tx/simulate_route_exact_in`, {
-    method: "POST",
-    headers: { ...headers, "content-type": "application/json" },
-    body: JSON.stringify({ route: routeObject, slippage: request.slippagePercent, from_address: recipient }),
+  const base = (request.apiBaseUrl ?? "https://openapi.gmgn.ai").replace(/\/$/, "");
+  const path = "/v1/trade/swap";
+  const body = JSON.stringify({
+    chain: ROBINHOOD_GMGN_CHAIN,
+    from_address: recipient,
+    input_token: ROBINHOOD_NATIVE_TOKEN,
+    output_token: tokenAddress,
+    input_amount: request.amountInWei.toString(),
+    slippage: request.slippagePercent,
+    is_anti_mev: true,
   });
-  if (!simulationResponse.ok) throw new Error(`GMGN simulation HTTP ${simulationResponse.status}`);
-  const simulation = object(responseData(await simulationResponse.json()), "simulation");
-  const transaction = mapTransaction(simulation, recipient);
-  if (transaction.value !== request.amountInWei) throw new Error("GMGN transaction value does not equal requested amount");
-  return { mode: "gmgn_unsigned_tx", route: routeObject, simulation, transaction };
+  const { timestamp, client_id } = authQuery();
+  const query = { timestamp, client_id };
+  const signature = signMessage(signedMessage(path, query, body, timestamp), request.privateKeyPem);
+  const response = await fetch(`${base}${path}?${new URLSearchParams({ timestamp: String(timestamp), client_id })}`, {
+    method: "POST",
+    headers: {
+      "X-APIKEY": request.apiKey,
+      "X-Signature": signature,
+      "Content-Type": "application/json",
+      accept: "application/json",
+    },
+    body,
+  });
+  if (!response.ok) throw new Error(`GMGN Agent API HTTP ${response.status}: ${await response.text()}`);
+  return { mode: "gmgn_agent_swap", response: responseData(await response.json()) };
 }

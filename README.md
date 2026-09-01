@@ -21,7 +21,7 @@ The request uses `alchemy_minedTransactions` with `addresses: [{ to: MOTHERSHIP_
 
 ### 2. Validate the bundle interaction
 
-For each mothership transaction notification, the bot fetches that transaction's receipt with `eth_getTransactionReceipt`. It accepts the transaction for candidate discovery only when the receipt contains a log that was emitted by the configured mothership address and whose first topic is the configured `BUNDLE_CREATED_TOPIC`.
+For each mothership transaction notification, the bot fetches that transaction's receipt with `eth_getTransactionReceipt`. It registers the initiating wallet when the successful transaction is sent to the mothership with the observed `createBundle(bytes32,uint8,uint64)` selector `0x33b8ac0e`. Candidate discovery does not depend on a hardcoded event topic; receipt logs are retained for the later launch analysis.
 
 The transaction's `from` address is the initiating wallet. The bot uses the transaction hash as the candidate's source preparation transaction and the transaction block number as its first-seen block metadata.
 
@@ -79,7 +79,7 @@ The event includes the candidate wallet, source preparation transaction, launch 
 
 When `BUY_RECIPIENT` is configured and a validated token is detected, the bot requests a route from GMGN for Robinhood Chain using native ETH as the input asset and the detected token as the output asset. It then submits the returned route to GMGN's documented simulation endpoint. A valid response must provide a complete transaction envelope including the route entry contract, calldata, value, chain ID, nonce, gas limit, and fee fields.
 
-The resulting plan is attached to `LAUNCH_DETECTED` as an unsigned transaction and validation report. The supported execution mode is `gmgn_unsigned_tx`; `gmgn_submit` is rejected. The bot never signs or broadcasts the result. GMGN route and simulation responses are used as returned; the bot does not construct a Pons-specific selector or assume a particular DEX route.
+With `BUY_ENABLED=true`, the bot submits `POST /v1/trade/swap` to GMGN's Agent API using `X-APIKEY`, `X-Signature`, `timestamp`, and `client_id`. The signature follows GMGN's documented `{sub_path}:{sorted_query}:{raw_body}:{timestamp}` format. This is a real hosted-wallet trade, not an unsigned transaction plan; the matching `GMGN_PRIVATE_KEY` must belong to the public key registered with GMGN. Keep `BUY_ENABLED=false` while testing.
 
 ## Configuration
 
@@ -88,9 +88,11 @@ Copy the template and provide the required endpoints:
 ```bash
 cp .env.example .env
 pnpm install
-pnpm typecheck
-pnpm start
+pnpm build
+pnpm start:production
 ```
+
+Use `pnpm dev` or `pnpm start` for the TypeScript development runner. The production command runs the compiled output from `dist/`. The listener validates required endpoints and numeric settings at startup, reconnects after an unexpected WebSocket close, and closes its socket cleanly on `SIGINT` or `SIGTERM`.
 
 Environment variables defined by the bot are:
 
@@ -99,13 +101,16 @@ Environment variables defined by the bot are:
 | `RPC_HTTP_URL` | Yes | HTTP JSON-RPC endpoint for targeted transaction, receipt, trace, bytecode, and token validation calls. |
 | `RPC_WS_URL` | Yes | WebSocket endpoint supporting address-filtered `alchemy_minedTransactions`. |
 | `MOTHERSHIP_ADDRESS` | No | Monitored contract. Defaults to the Pons V2 mothership address. |
-| `BUNDLE_CREATED_TOPIC` | No | Receipt log topic used to identify qualifying mothership interactions. Candidate discovery is disabled when unset. |
-| `CANDIDATE_TTL_MS` | No | Candidate lifetime in milliseconds. Defaults to `900000` (15 minutes). |
-| `BUY_ENABLED` | No | Safety flag. Defaults to `false`; signing and broadcasting remain disabled. |
+| `CANDIDATE_TTL_MS` | No | Candidate lifetime in milliseconds. Defaults to `604800000` (7 days). A new `createBundle` from the same wallet replaces and refreshes its candidate entry. |
+| `INITIAL_CANDIDATE_WALLETS` | No | Comma-separated wallet addresses to seed as candidates at startup. The template includes the explicitly requested wallet as an example; remove or replace it as needed. Each seeded wallet follows the same expiry and launch validation rules as a discovered wallet. |
+| `BUY_PLAN` | No | Preferred prepare-only flag. If `true`, the bot prepares and logs a GMGN route plan but never submits or broadcasts it. |
+| `BUY_EXECUTE` | No | Must remain `false` for this repo. It hard-disables send/submit logic; no eth_sendRawTransaction or GMGN execution path is allowed. |
+| `BUY_ENABLED` | No | Backward-compatible alias for `BUY_PLAN`; treated as prepare-only mode and never executes. |
 | `BUY_RECIPIENT` | No | Bot wallet that receives purchased tokens and is sent to GMGN as `from_address`. A BUY plan is omitted when unset. |
-| `BUY_AMOUNT_WEI` | No | Native ETH input amount. Defaults to `800000000000000` wei (`0.0008 ETH`). |
-| `BUY_EXECUTION_MODE` | No | `gmgn_unsigned_tx` is the only supported mode. Other modes fail closed. |
-| `GMGN_API_KEY` | Required for BUY planning | GMGN route API key, sent only as the `x-route-key` header. |
+| `BUY_AMOUNT_WEI` | No | Native ETH input amount. Accepts decimal ETH such as `0.0008` or an integer wei value. Defaults to `0.0008 ETH`. |
+| `BUY_EXECUTION_MODE` | No | `gmgn_agent_swap` is the supported Agent API execution mode. |
+| `GMGN_API_KEY` | Required for GMGN quote/plan creation | GMGN Agent API key created at `gmgn.ai/ai` and sent as `X-APIKEY`. |
+| `GMGN_PRIVATE_KEY` | Required for GMGN quote/plan creation | PEM Ed25519 or RSA private key matching the public key registered with GMGN. Used locally to sign Agent API requests. |
 | `GMGN_SLIPPAGE_PERCENT` | No | Slippage percentage passed to GMGN simulation. Defaults to `15`. |
 
 Do not place API keys, private keys, or credential-bearing files in source control. The bot redacts the credential portion of `/v2/<key>` WebSocket URLs in its connection log.
@@ -114,12 +119,12 @@ Do not place API keys, private keys, or credential-bearing files in source contr
 
 - WebSocket reconnects are automatic after a connection closes, and subscriptions are recreated on the new connection.
 - A subscription acknowledgement confirms provider acceptance; it does not by itself prove transaction delivery.
-- Candidate wallets are held in process memory and expire after `CANDIDATE_TTL_MS`.
+- Candidate wallets are held in process memory and expire after `CANDIDATE_TTL_MS`; a periodic cleanup removes expired wallets from the active subscription. Reusing a wallet in a later successful `createBundle` registers it again with a fresh expiry. Candidates do not survive a process restart.
 - At most 1,000 candidate wallets are included in one candidate subscription refresh.
 - Receipt, bytecode, metadata, and trace calls depend on the configured HTTP provider. Trace support is optional; receipt evidence remains the primary analysis input.
 - The bot does not persist candidates or replay missed WebSocket notifications after a process restart.
-- `BUY_ENABLED=false` is the intended current mode. The bot detects launches and can produce an unsigned GMGN dry-run plan but does not sign or broadcast transactions.
-- BUY planning requires a configured recipient, `GMGN_API_KEY`, and a valid GMGN route/simulation response. The planner returns an unsigned transaction only; no signing or broadcasting is implemented.
+- `BUY_ENABLED=false` is the intended current mode. The bot detects launches but does not call GMGN.
+- BUY execution requires a configured recipient, `GMGN_API_KEY`, matching `GMGN_PRIVATE_KEY`, funded GMGN Robinhood trading wallet, and a valid Agent API response. Agent API swaps are real transactions.
 - A candidate wallet must be discovered before its wallet-specific subscription exists. Transactions before discovery or during a WebSocket outage may not be observed.
 
 ## Tests

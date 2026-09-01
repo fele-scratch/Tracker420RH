@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { isCreateBundleTransaction, isSuccessfulReceipt } from "../src/detection.js";
 import { extractAddressCandidates, extractTraceAddresses, extractZeroAddressMints, hasLaunchEvidence } from "../src/launch-analysis.js";
 
 const MOTHERSHIP = "0x6bed168687c1bca3466f1f3fb188c2dd058f4597";
-const BUNDLE_TOPIC = "0x1cc27e421486e19dd9942a7d534956723c7b40410db99dea6c2be261d16ccae2";
 const TX_PATH = new URL("../audit/external_launch_tx.json", import.meta.url);
 const RECEIPT_PATH = new URL("../audit/external_launch_receipt.json", import.meta.url);
 const PREP_TX_PATH = new URL("../audit/mothership_prep_tx.json", import.meta.url);
@@ -29,18 +29,10 @@ test("real-data 0x6bed preparation -> candidate subscription -> launch evidence 
   const prepTx = prepEnvelope.result;
   const tx = txEnvelope.result;
   const receipt = receiptEnvelope.result;
-  assert.equal(prepTx.to.toLowerCase(), MOTHERSHIP);
+  assert.equal(isCreateBundleTransaction(prepTx, MOTHERSHIP), true);
+  assert.equal(isSuccessfulReceipt(receiptEnvelope.result), true);
   assert.equal(typeof prepTx.from, "string");
   assert.equal(tx.from.toLowerCase(), prepTx.from.toLowerCase());
-
-  const bundleNotification = {
-    address: MOTHERSHIP,
-    topics: [BUNDLE_TOPIC],
-    transactionHash: prepTx.hash,
-    blockNumber: prepTx.blockNumber,
-  };
-  assert.equal(bundleNotification.address.toLowerCase(), MOTHERSHIP);
-  assert.equal(bundleNotification.topics[0], BUNDLE_TOPIC);
 
   const candidateWallet = prepTx.from.toLowerCase();
   const subscriptionRequest = {
