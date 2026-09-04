@@ -5,6 +5,7 @@ import WebSocket from "ws";
 import { CREATE_BUNDLE_SELECTOR, isSuccessfulReceipt, isCreateBundleTransaction } from "./detection.js";
 import { resolveBuySessionFlags } from "./buy-flags.js";
 import { buildGmgnUnsignedBuy } from "./gmgn-buy.js";
+import { firstMeaningfulInboundFrom, isActiveCandidate, isFundAmountInRange, weiToEth } from "./candidate-analysis.js";
 import { decodeLaunchAndBuyArgs, extractAddressCandidates, extractPonsLaunchTokenCandidates, extractTraceAddresses, extractZeroAddressMints, hasLaunchEvidence, selector } from "./launch-analysis.js";
 
 const HTTP = must("RPC_HTTP_URL");
@@ -12,11 +13,13 @@ const WS = must("RPC_WS_URL");
 const MOTHERSHIP = address(process.env.MOTHERSHIP_ADDRESS ?? "0x6bed168687c1bca3466f1f3fb188c2dd058f4597");
 const PONS_LAUNCH_ROUTER = address("0xe33E9E479dF8802cb0866d5d05258bEc4cF62948");
 const LAUNCH_SELECTOR = "0xf85f8e41";
-const OKX_FUNDER = address("0x53091256EBD2D8aA37B45536A5FD864ca764f32f");
-const MIN_EXEMPTIONS = positiveNumber(process.env.MIN_EXEMPTIONS, 25, "MIN_EXEMPTIONS");
-const MAX_EXEMPTIONS = positiveNumber(process.env.MAX_EXEMPTIONS, 32, "MAX_EXEMPTIONS");
+const OKX_FUNDER = address(process.env.OKX_FUNDER ?? "0x53091256EBD2D8aA37B45536A5FD864ca764f32f");
+const MIN_FUND_ETH = positiveNumber(process.env.MIN_FUND_ETH, 0.56, "MIN_FUND_ETH");
+const MAX_FUND_ETH = positiveNumber(process.env.MAX_FUND_ETH, 3.6, "MAX_FUND_ETH");
+const FUND_ALERT_MIN_ETH = positiveNumber(process.env.FUND_ALERT_MIN_ETH, 0.6, "FUND_ALERT_MIN_ETH");
+const FUND_ALERT_MAX_ETH = positiveNumber(process.env.FUND_ALERT_MAX_ETH, 1.1, "FUND_ALERT_MAX_ETH");
 const MOTHERSHIP_DISCOVERY_ENABLED = process.env.MOTHERSHIP_DISCOVERY_ENABLED === "true";
-const CANDIDATE_TTL_MS = positiveNumber(process.env.CANDIDATE_TTL_MS, 604_800_000, "CANDIDATE_TTL_MS");
+const CANDIDATE_TTL_MS = positiveNumber(process.env.CANDIDATE_TTL_MS, 172_800_000, "CANDIDATE_TTL_MS");
 const INITIAL_CANDIDATE_WALLETS = (process.env.INITIAL_CANDIDATE_WALLETS ?? "")
   .split(",")
   .map((value) => value.trim())
@@ -44,12 +47,14 @@ const BUY_EXECUTION_MODE = process.env.BUY_EXECUTION_MODE ?? "gmgn_agent_swap";
 const GMGN_SLIPPAGE_PERCENT = positiveNumber(process.env.GMGN_SLIPPAGE_PERCENT, 15, "GMGN_SLIPPAGE_PERCENT");
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const FUND_ALERT_BOT_TOKEN = process.env.FUND_ALERT_BOT_TOKEN;
+const FUND_ALERT_CHAT_ID = process.env.FUND_ALERT_CHAT_ID;
 
 type RpcResponse<T> = { result?: T; error?: { code: number; message: string } };
-type Tx = { hash: string; from: string; to: string | null; input: string; blockNumber?: string; transactionIndex?: string };
+type Tx = { hash: string; from: string; to: string | null; input: string; value?: string; blockNumber?: string; transactionIndex?: string };
 type Log = { address: string; topics: string[]; data: string; transactionHash: string; blockNumber: string; logIndex: string };
 type Receipt = { status: string; contractAddress?: string | null; logs: Log[] };
-type Candidate = { wallet: string; firstSeenBlock: bigint; expiresAt: number; sourceTx: string };
+type Candidate = { wallet: string; amountEth?: number; firstSeenAt: number; firstSeenBlock: bigint; expiresAt: number; sourceTx: string };
 
 const candidates = new Map<string, Candidate>();
 const funderChecks = new Map<string, Promise<boolean>>();
@@ -100,12 +105,12 @@ function html(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-async function sendTelegramMessage(message: string): Promise<void> {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+async function sendTelegramMessage(message: string, botToken = TELEGRAM_BOT_TOKEN, chatId = TELEGRAM_CHAT_ID): Promise<void> {
+  if (!botToken || !chatId) return;
+  const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML" }),
+    body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" }),
   });
   if (!response.ok) throw new Error(`Telegram HTTP ${response.status}: ${await response.text()}`);
 }
@@ -122,6 +127,16 @@ async function notifyBuySuccess(tokenCA: string, response: unknown): Promise<voi
   if (!BUY_EXECUTE || !response || typeof response !== "object") return;
   const result = response as Record<string, unknown>;
   const status = String(result.status ?? result.state ?? "").toLowerCase();
+  if (["failed", "failure", "rejected", "error"].includes(status)) {
+    const reason = result.reason ?? result.msg ?? result.message ?? status;
+    log("BUY_FAILED", { tokenCA, reason });
+    try {
+      await sendTelegramMessage(`buy failed\nCA: <code>${html(tokenCA)}</code>\nerror: ${html(String(reason))}`);
+    } catch (error) {
+      log("TELEGRAM_NOTIFY_ERROR", { event: "buy-failure", error: String(error) });
+    }
+    return;
+  }
   if (!["accepted", "submitted", "success", "succeeded", "pending"].includes(status)) return;
   const hash = result.tx_hash ?? result.transaction_hash ?? result.hash ?? result.order_id;
   if (hash === undefined) return;
@@ -129,6 +144,24 @@ async function notifyBuySuccess(tokenCA: string, response: unknown): Promise<voi
     await sendTelegramMessage(`buy succeeded\nCA: <code>${html(tokenCA)}</code>\norder/tx: <code>${html(String(hash))}</code>`);
   } catch (error) {
     log("TELEGRAM_NOTIFY_ERROR", { event: "buy-success", error: String(error) });
+  }
+}
+
+async function notifyBuyFailure(tokenCA: string, launchTx: string, error: unknown): Promise<void> {
+  if (!BUY_EXECUTE) return;
+  try {
+    await sendTelegramMessage(`buy failed\nCA: <code>${html(tokenCA)}</code>\nlaunchTx: <code>${html(launchTx)}</code>\nerror: ${html(String(error))}`);
+  } catch (notificationError) {
+    log("TELEGRAM_NOTIFY_ERROR", { event: "buy-failure", error: String(notificationError) });
+  }
+}
+
+async function notifyFundAlert(wallet: string, amountEth: number, fundTx: string): Promise<void> {
+  if (amountEth < FUND_ALERT_MIN_ETH || amountEth > FUND_ALERT_MAX_ETH) return;
+  try {
+    await sendTelegramMessage(`CANDIDATE_FUNDED\nwallet: <code>${html(wallet)}</code>\namount: ${amountEth} ETH\nfundTx: <code>${html(fundTx)}</code>`, FUND_ALERT_BOT_TOKEN, FUND_ALERT_CHAT_ID);
+  } catch (error) {
+    log("TELEGRAM_NOTIFY_ERROR", { event: "candidate-funded", error: String(error) });
   }
 }
 
@@ -162,12 +195,7 @@ async function wasFundedByOkx(recipient: string): Promise<boolean> {
       const result = await rpc<{ transfers?: Array<{ from?: string; to?: string; value?: number; asset?: string }> }>("alchemy_getAssetTransfers", [{
         fromBlock: "0x0", toBlock: "latest", toAddress: key, category: ["external"], order: "asc", maxCount: "0x20",
       }]);
-      const firstFunding = (result.transfers ?? []).find((transfer) =>
-        transfer.to?.toLowerCase() === key && transfer.from &&
-        transfer.from.toLowerCase() !== "0x0000000000000000000000000000000000000000" &&
-        (transfer.asset === undefined || transfer.asset === "ETH") && (transfer.value ?? 0) > 0,
-      );
-      return firstFunding?.from?.toLowerCase() === OKX_FUNDER;
+      return firstMeaningfulInboundFrom(result.transfers ?? [], key) === OKX_FUNDER;
     } catch (error) {
       log("FUNDER_CHECK_ERROR", { recipient: key, error: String(error) });
       return false;
@@ -220,16 +248,35 @@ async function prepareBuyPlan(tokenAddress: string, launchTx: Tx): Promise<Recor
   return { ...plan, launchTransaction: launchTx.hash, signed: true, execute: BUY_EXECUTE, broadcast: BUY_EXECUTE, dryRun: !BUY_EXECUTE };
 }
 
-function discoverCandidate(wallet: string, block: bigint, sourceTx: string): void {
+function discoverCandidate(wallet: string, block: bigint, sourceTx: string, amountEth?: number): void {
   const key = wallet.toLowerCase();
+  const firstSeenAt = Date.now();
   candidates.set(key, {
     wallet: key,
+    amountEth,
+    firstSeenAt,
     firstSeenBlock: block,
     expiresAt: Date.now() + CANDIDATE_TTL_MS,
     sourceTx,
   });
   log("CANDIDATE_WALLET", { wallet: key, firstSeenBlock: block.toString(), sourceTx });
   refreshCandidateSubscriptions?.();
+}
+
+async function handleFunderTransaction(tx: Tx): Promise<void> {
+  if (tx.from.toLowerCase() !== OKX_FUNDER || !tx.to || tx.value === undefined) return;
+  const recipient = tx.to.toLowerCase();
+  const valueWei = BigInt(tx.value);
+  const amountEth = weiToEth(valueWei);
+  const passAmount = isFundAmountInRange(valueWei, MIN_FUND_ETH, MAX_FUND_ETH);
+  const passFirstFunding = await wasFundedByOkx(recipient);
+  const reason = !passAmount ? "amount-out-of-range" : !passFirstFunding ? "not-first-funding" : "accepted";
+  log("FUNDER_TX", { to: recipient, valueEth: amountEth, passAmount, passFirstFunding, reason });
+  if (!passAmount || !passFirstFunding) return;
+  discoverCandidate(recipient, tx.blockNumber ? BigInt(tx.blockNumber) : 0n, tx.hash, amountEth);
+  const candidate = candidates.get(recipient);
+  log("CANDIDATE_FUNDED", { wallet: recipient, amountEth, firstSeenAt: candidate?.firstSeenAt, expiresAt: candidate?.expiresAt, fundTx: tx.hash });
+  await notifyFundAlert(recipient, amountEth, tx.hash);
 }
 
 for (const wallet of INITIAL_CANDIDATE_WALLETS) {
@@ -327,8 +374,14 @@ async function handleMothershipTransaction(tx: Tx): Promise<void> {
 async function handlePonsLaunchTransaction(tx: Tx): Promise<void> {
   if (tx.to?.toLowerCase() !== PONS_LAUNCH_ROUTER || selector(tx.input) !== LAUNCH_SELECTOR) return;
   log("PONS_TX_RECEIVED", { launchTx: tx.hash });
-  const decoded = decodeLaunchAndBuyArgs(tx.input, MIN_EXEMPTIONS, MAX_EXEMPTIONS);
-  if (!decoded || !(await wasFundedByOkx(decoded.recipient))) return;
+  const decoded = decodeLaunchAndBuyArgs(tx.input);
+  if (!decoded) return;
+  const candidate = candidates.get(decoded.recipient);
+  if (!isActiveCandidate(candidates, decoded.recipient)) {
+    candidates.delete(decoded.recipient);
+    return;
+  }
+  if (!candidate) return;
   const receipt = await getReceipt(tx.hash);
   if (!isSuccessfulReceipt(receipt)) return;
   const zeroMintTokens = extractZeroAddressMints(receipt);
@@ -340,15 +393,15 @@ async function handlePonsLaunchTransaction(tx: Tx): Promise<void> {
       buyPlan = await prepareBuyPlan(tokenAddress, tx);
     } catch (error) {
       log("BUY_PLAN_UNAVAILABLE", { reason: String(error), launchTx: tx.hash, tokenAddress });
+      await notifyBuyFailure(tokenAddress, tx.hash, error);
     }
   }
   log("LAUNCH_DETECTED", {
     launchTx: tx.hash,
-    router: PONS_LAUNCH_ROUTER,
     selector: LAUNCH_SELECTOR,
     arg5: decoded.recipient,
     exemptionCount: decoded.exemptions.length,
-    funderCheck: true,
+    candidateFundTx: candidate.sourceTx,
     tokenCA: tokenAddress,
     mintedTokens: zeroMintTokens,
     detectionEvidence: { zeroAddressMintTokens: zeroMintTokens },
@@ -371,6 +424,8 @@ function connect(): void {
   let mothershipMiningRequestId: number | null = null;
   let ponsLaunchMiningSubscriptionId: string | null = null;
   let ponsLaunchMiningRequestId: number | null = null;
+  let funderMiningSubscriptionId: string | null = null;
+  let funderMiningRequestId: number | null = null;
 
   const syncCandidateMiningSubscription = (): void => {
     if (!socketReady) return;
@@ -404,6 +459,7 @@ function connect(): void {
   socket.on("open", () => {
     socketReady = true;
     log("WS_CONNECTED", { endpoint: safeEndpoint(WS) });
+    log("ROUTER_SUBSCRIBED", { to: PONS_LAUNCH_ROUTER, selector: LAUNCH_SELECTOR });
     ponsLaunchMiningRequestId = nextId++;
     socket.send(JSON.stringify({
       jsonrpc: "2.0",
@@ -411,6 +467,18 @@ function connect(): void {
       method: "eth_subscribe",
       params: ["alchemy_minedTransactions", {
         addresses: [{ to: PONS_LAUNCH_ROUTER }],
+        includeRemoved: false,
+        hashesOnly: false,
+      }],
+    }));
+    log("FUNDER_SUBSCRIBED", { from: OKX_FUNDER });
+    funderMiningRequestId = nextId++;
+    socket.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: funderMiningRequestId,
+      method: "eth_subscribe",
+      params: ["alchemy_minedTransactions", {
+        addresses: [{ from: OKX_FUNDER }],
         includeRemoved: false,
         hashesOnly: false,
       }],
@@ -448,12 +516,14 @@ function connect(): void {
         if (message.id === candidateMiningRequestId) candidateMiningSubscriptionId = message.result;
         if (message.id === mothershipMiningRequestId) mothershipMiningSubscriptionId = message.result;
         if (message.id === ponsLaunchMiningRequestId) ponsLaunchMiningSubscriptionId = message.result;
+        if (message.id === funderMiningRequestId) funderMiningSubscriptionId = message.result;
         log("WS_SUBSCRIPTION_ACCEPTED", {
           requestId: message.id,
           subscription: message.result,
           stream: message.id === candidateMiningRequestId ? "candidate-wallets" :
             message.id === mothershipMiningRequestId ? "mothership-to-filter" :
-              message.id === ponsLaunchMiningRequestId ? "pons-launch-router" : "other",
+              message.id === ponsLaunchMiningRequestId ? "pons-launch-router" :
+                message.id === funderMiningRequestId ? "okx-funder-from-filter" : "other",
         });
         return;
       }
@@ -462,6 +532,9 @@ function connect(): void {
       if (message.params?.subscription === ponsLaunchMiningSubscriptionId) {
         const mined = result as { removed: boolean; transaction: Tx };
         if (!mined.removed) await handlePonsLaunchTransaction(mined.transaction);
+      } else if (message.params?.subscription === funderMiningSubscriptionId) {
+        const mined = result as { removed: boolean; transaction: Tx };
+        if (!mined.removed) await handleFunderTransaction(mined.transaction);
       } else if (message.params?.subscription === mothershipMiningSubscriptionId) {
         await handleMothershipTransaction(result as unknown as Tx);
       } else if ("transaction" in result) {
@@ -482,6 +555,8 @@ function connect(): void {
     mothershipMiningRequestId = null;
     ponsLaunchMiningSubscriptionId = null;
     ponsLaunchMiningRequestId = null;
+    funderMiningSubscriptionId = null;
+    funderMiningRequestId = null;
     if (activeSocket === socket) activeSocket = null;
     if (shuttingDown) {
       log("WS_CLOSED");

@@ -15,7 +15,7 @@ export function selector(input: string): string {
   return input.length >= 10 ? input.slice(0, 10).toLowerCase() : "0x";
 }
 
-export function decodeLaunchAndBuyArgs(input: string, minExemptions = 25, maxExemptions = 32): LaunchAndBuyArgs | null {
+export function decodeLaunchAndBuyArgs(input: string, minExemptions?: number, maxExemptions?: number): LaunchAndBuyArgs | null {
   if (selector(input) !== "0xf85f8e41" || !WORD.test(input)) return null;
   const args = input.slice(10);
   const word = (index: number): string | null => {
@@ -32,7 +32,7 @@ export function decodeLaunchAndBuyArgs(input: string, minExemptions = 25, maxExe
   const countWord = args.slice(exemptionsOffset, exemptionsOffset + 64);
   if (countWord.length !== 64) return null;
   const count = Number.parseInt(countWord, 16);
-  if (!Number.isSafeInteger(count) || count < minExemptions || count > maxExemptions) return null;
+  if (!Number.isSafeInteger(count) || (minExemptions !== undefined && count < minExemptions) || (maxExemptions !== undefined && count > maxExemptions)) return null;
   const exemptions: string[] = [];
   for (let index = 0; index < count; index++) {
     const value = args.slice(exemptionsOffset + 64 + index * 64, exemptionsOffset + 128 + index * 64);

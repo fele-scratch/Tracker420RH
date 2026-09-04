@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isCreateBundleTransaction, isSuccessfulReceipt } from "../src/detection.js";
+import { firstMeaningfulInboundFrom, isActiveCandidate, isFundAmountInRange } from "../src/candidate-analysis.js";
 import {
   extractAddressCandidates,
   decodeLaunchAndBuyArgs,
@@ -156,6 +157,39 @@ test("decodes launchAndBuy recipient and bounded exemption list", () => {
   const decoded = decodeLaunchAndBuyArgs(launchAndBuyInput(25));
   assert.equal(decoded?.recipient, "0x1010101010101010101010101010101010101010");
   assert.equal(decoded?.exemptions.length, 25);
-  assert.equal(decodeLaunchAndBuyArgs(launchAndBuyInput(24)), null);
-  assert.equal(decodeLaunchAndBuyArgs(launchAndBuyInput(33)), null);
+  assert.equal(decodeLaunchAndBuyArgs(launchAndBuyInput(24), 25, 32), null);
+  assert.equal(decodeLaunchAndBuyArgs(launchAndBuyInput(33), 25, 32), null);
+});
+
+test("accepts fund amounts only within inclusive bounds", () => {
+  assert.equal(isFundAmountInRange(560000000000000000n, 0.56, 3.6), true);
+  assert.equal(isFundAmountInRange(3600000000000000000n, 0.56, 3.6), true);
+  assert.equal(isFundAmountInRange(559999999999999999n, 0.56, 3.6), false);
+  assert.equal(isFundAmountInRange(3600000000000000001n, 0.56, 3.6), false);
+});
+
+test("accepts the funder only when it is the first meaningful inbound", () => {
+  const recipient = "0x1010101010101010101010101010101010101010";
+  const funder = "0x53091256EBD2D8aA37B45536A5FD864ca764f32f";
+  const other = "0x2020202020202020202020202020202020202020";
+  assert.equal(firstMeaningfulInboundFrom([
+    { from: "0x0000000000000000000000000000000000000000", to: recipient, value: 1 },
+    { from: funder, to: recipient, value: 0.56, asset: "ETH" },
+  ], recipient), funder.toLowerCase());
+  assert.equal(firstMeaningfulInboundFrom([
+    { from: other, to: recipient, value: 0.1, asset: "ETH" },
+    { from: funder, to: recipient, value: 0.56, asset: "ETH" },
+  ], recipient), other.toLowerCase());
+});
+
+test("decodes launchAndBuy regardless of exemption count", () => {
+  assert.equal(decodeLaunchAndBuyArgs(launchAndBuyInput(1))?.recipient, "0x1010101010101010101010101010101010101010");
+});
+
+test("matches only active candidate inventory entries", () => {
+  const wallet = "0x1010101010101010101010101010101010101010";
+  const inventory = new Map([[wallet, { expiresAt: 200 }]]);
+  assert.equal(isActiveCandidate(inventory, wallet.toUpperCase(), 100), true);
+  assert.equal(isActiveCandidate(inventory, wallet, 200), false);
+  assert.equal(isActiveCandidate(inventory, "0x2020202020202020202020202020202020202020", 100), false);
 });

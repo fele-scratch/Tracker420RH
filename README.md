@@ -2,10 +2,12 @@
 
 Tracker420RH is a real-time Robinhood Chain listener. It watches the Pons V2 mothership, identifies wallets that initiate qualifying bundle interactions, follows those wallets for their next mined transactions, reports verified token launches, and can prepare a GMGN-routed unsigned BUY plan.
 
-The production listener uses two address-filtered `alchemy_minedTransactions` subscriptions:
+The production listener uses address-filtered `alchemy_minedTransactions` subscriptions:
 
-1. A `to`-filtered subscription for the monitored mothership contract.
-2. A `from`-filtered subscription that is rebuilt for currently active candidate wallets.
+1. A `from`-filtered subscription for the OKX funder, which pre-collects fresh funded wallets.
+2. A `to`-filtered subscription for the Pons launch router.
+3. A `to`-filtered subscription for the monitored mothership contract when enabled.
+4. A `from`-filtered subscription that is rebuilt for currently active candidate wallets.
 
 ## Production flow
 
@@ -101,7 +103,9 @@ Environment variables defined by the bot are:
 | `RPC_HTTP_URL` | Yes | HTTP JSON-RPC endpoint for targeted transaction, receipt, trace, bytecode, and token validation calls. |
 | `RPC_WS_URL` | Yes | WebSocket endpoint supporting address-filtered `alchemy_minedTransactions`. |
 | `MOTHERSHIP_ADDRESS` | No | Monitored contract. Defaults to the Pons V2 mothership address. |
-| `CANDIDATE_TTL_MS` | No | Candidate lifetime in milliseconds. Defaults to `604800000` (7 days). A new `createBundle` from the same wallet replaces and refreshes its candidate entry. |
+| `MIN_FUND_ETH` / `MAX_FUND_ETH` | No | Inclusive native funding bounds for OKX funder discovery. Defaults to `0.56` and `3.6`. |
+| `CANDIDATE_TTL_MS` | No | Candidate lifetime in milliseconds. Defaults to `172800000` (48 hours). |
+| `FUND_ALERT_BOT_TOKEN` / `FUND_ALERT_CHAT_ID` | No | Separate Telegram destination for qualifying `0.6` to `1.1` ETH funding alerts. |
 | `INITIAL_CANDIDATE_WALLETS` | No | Comma-separated wallet addresses to seed as candidates at startup. The template includes the explicitly requested wallet as an example; remove or replace it as needed. Each seeded wallet follows the same expiry and launch validation rules as a discovered wallet. |
 | `BUY_PLAN` | No | Preferred prepare-only flag. If `true`, the bot prepares and logs a GMGN route plan but never submits or broadcasts it. |
 | `BUY_EXECUTE` | No | Must remain `false` for this repo. It hard-disables send/submit logic; no eth_sendRawTransaction or GMGN execution path is allowed. |
