@@ -8,6 +8,9 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "tsx src/index.ts",
     "start:production": "node dist/index.js",
+    "pm2:start": "npm run build && pm2 start ecosystem.config.cjs",
+    "pm2:restart": "npm run build && pm2 restart tracker420rh --update-env",
+    "pm2:logs": "pm2 logs tracker420rh",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/**/*.test.ts",
     "test:buy-dry-run": "tsx --test test/buy-simulator.test.ts"
