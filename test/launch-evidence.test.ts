@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isCreateBundleTransaction, isSuccessfulReceipt } from "../src/detection.js";
-import { firstMeaningfulInboundFrom, isActiveCandidate, isFundAmountInRange } from "../src/candidate-analysis.js";
+import { firstMeaningfulInboundFrom, firstNonBlockedToken, isActiveCandidate, isFirstFundedByOkx, isFundAmountInRange } from "../src/candidate-analysis.js";
 import {
   extractAddressCandidates,
   decodeLaunchAndBuyArgs,
@@ -182,6 +182,25 @@ test("accepts the funder only when it is the first meaningful inbound", () => {
   ], recipient), other.toLowerCase());
 });
 
+test("requires the triggering OKX transfer to be the first inbound transaction", () => {
+  const recipient = "0x1010101010101010101010101010101010101010";
+  const funder = "0x53091256EBD2D8aA37B45536A5FD864ca764f32f";
+  const fundingTxHash = "0xfunding";
+  assert.equal(isFirstFundedByOkx(
+    [{ from: funder, to: recipient, value: 0.56, asset: "ETH", hash: fundingTxHash }],
+    recipient, funder, fundingTxHash,
+  ), true);
+  assert.equal(isFirstFundedByOkx(
+    [{ from: "0x2020202020202020202020202020202020202020", to: recipient, value: 0.1, asset: "ETH", hash: "0xprior" },
+      { from: funder, to: recipient, value: 0.56, asset: "ETH", hash: fundingTxHash }],
+    recipient, funder, fundingTxHash,
+  ), false);
+  assert.equal(isFirstFundedByOkx(
+    [{ from: funder, to: recipient, value: 0.56, asset: "ETH", hash: fundingTxHash }],
+    recipient, funder, "0xother",
+  ), false);
+});
+
 test("decodes launchAndBuy regardless of exemption count", () => {
   assert.equal(decodeLaunchAndBuyArgs(launchAndBuyInput(1))?.recipient, "0x1010101010101010101010101010101010101010");
 });
@@ -192,4 +211,29 @@ test("matches only active candidate inventory entries", () => {
   assert.equal(isActiveCandidate(inventory, wallet.toUpperCase(), 100), true);
   assert.equal(isActiveCandidate(inventory, wallet, 200), false);
   assert.equal(isActiveCandidate(inventory, "0x2020202020202020202020202020202020202020", 100), false);
+});
+
+test("reported swap and modifyLiquidities hashes fail the strict launch gate", () => {
+  const router = "0xe33e9e479df8802cb0866d5d05258bec4cf62948";
+  const reported = [
+    ["0xac82217f33ade324226cbdce51156490bbd0d24816893f8ee1b65cb73f438062", "0xdd46508f"],
+    ["0x00010c0ca5c1f361799f88c89ecae0c34d07bbe423203979ca8fc1b018818605", "0x4d819a2a"],
+    ["0x39d2e6736ecd329af466d687f2315b8ed9a30e3da8e6317df6c01f124f07fa16", "0x4d819a2a"],
+  ];
+  for (const [hash, method] of reported) {
+    const tx = { hash, to: router, input: method };
+    const passesLaunchGate = tx.to?.toLowerCase() === router && tx.input.slice(0, 10).toLowerCase() === "0xf85f8e41";
+    assert.equal(passesLaunchGate, false, hash);
+  }
+});
+
+test("skips WETH and zero address when selecting a zero mint token", () => {
+  const blocklist = new Set([
+    "0x0000000000000000000000000000000000000000",
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+  ]);
+  assert.equal(firstNonBlockedToken([
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+    "0x1111111111111111111111111111111111111111",
+  ], blocklist), "0x1111111111111111111111111111111111111111");
 });

@@ -12,6 +12,7 @@ export type AssetTransfer = {
   to?: string;
   value?: number | string;
   asset?: string;
+  hash?: string;
 };
 
 export function isFundAmountInRange(valueWei: bigint, minEth: number, maxEth: number): boolean {
@@ -31,6 +32,10 @@ export function isActiveCandidate(candidates: Map<string, CandidateRecord>, wall
   return candidate !== undefined && candidate.expiresAt > now;
 }
 
+export function firstNonBlockedToken(tokens: string[], blocklist: Set<string>): string | undefined {
+  return tokens.find((token) => !blocklist.has(token.toLowerCase()));
+}
+
 export function firstMeaningfulInboundFrom(transfers: AssetTransfer[], recipient: string): string | null {
   const key = recipient.toLowerCase();
   const first = transfers.find((transfer) => {
@@ -40,4 +45,21 @@ export function firstMeaningfulInboundFrom(transfers: AssetTransfer[], recipient
     return Number(transfer.value ?? 0) > 0;
   });
   return first?.from?.toLowerCase() ?? null;
+}
+
+export function isFirstFundedByOkx(
+  inbound: AssetTransfer[],
+  recipient: string,
+  funder: string,
+  fundingTxHash: string,
+): boolean {
+  const key = recipient.toLowerCase();
+  const firstMeaningfulInbound = inbound.find((transfer) => {
+    if (transfer.to?.toLowerCase() !== key || !transfer.from) return false;
+    if (!ADDRESS.test(transfer.from) || transfer.from.toLowerCase() === ZERO_ADDRESS) return false;
+    if (transfer.asset !== undefined && transfer.asset !== "ETH") return false;
+    return Number(transfer.value ?? 0) > 0;
+  });
+  return firstMeaningfulInbound?.from?.toLowerCase() === funder.toLowerCase()
+    && firstMeaningfulInbound.hash?.toLowerCase() === fundingTxHash.toLowerCase();
 }

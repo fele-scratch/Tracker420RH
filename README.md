@@ -1,13 +1,13 @@
 # Tracker420RH
 
-Tracker420RH is a real-time Robinhood Chain listener. It watches the Pons V2 mothership, identifies wallets that initiate qualifying bundle interactions, follows those wallets for their next mined transactions, reports verified token launches, and can prepare a GMGN-routed unsigned BUY plan.
+Tracker420RH is a real-time Robinhood Chain listener. It watches the OKX funder and Pons V2 launch router, inventories freshly funded wallets, reports verified router launches, and can prepare a GMGN-routed unsigned BUY plan.
 
 The production listener uses address-filtered `alchemy_minedTransactions` subscriptions:
 
 1. A `from`-filtered subscription for the OKX funder, which pre-collects fresh funded wallets.
 2. A `to`-filtered subscription for the Pons launch router.
 3. A `to`-filtered subscription for the monitored mothership contract when enabled.
-4. A `from`-filtered subscription that is rebuilt for currently active candidate wallets.
+4. Candidate wallets are held in memory and matched against router calldata; candidate-wallet activity is not a launch signal.
 
 ## Production flow
 
@@ -29,31 +29,11 @@ The transaction's `from` address is the initiating wallet. The bot uses the tran
 
 ### 3. Register the candidate wallet
 
-The initiating wallet is normalized to lowercase and stored with its wallet address, source preparation transaction hash, first-seen block number, and an expiration time based on `CANDIDATE_TTL_MS`. Registering or refreshing a candidate immediately rebuilds the wallet subscription.
+The initiating wallet is normalized to lowercase and stored with its wallet address, source preparation transaction hash, first-seen block number, and an expiration time based on `CANDIDATE_TTL_MS`.
 
-### 4. Subscribe to candidate wallets
+### 4. Gate router launches
 
-The bot subscribes to active candidate wallets with the same verified mined-transaction method, filtering by sender:
-
-```json
-{
-  "method": "eth_subscribe",
-  "params": [
-    "alchemy_minedTransactions",
-    {
-      "addresses": [{ "from": "DISCOVERED_WALLET" }],
-      "includeRemoved": false,
-      "hashesOnly": false
-    }
-  ]
-}
-```
-
-When the candidate set changes, the previous candidate subscription is removed and replaced with a subscription containing the current wallet set. At most 1,000 wallets are included in one request; the bot logs when the candidate set exceeds that limit.
-
-### 5. Receive and inspect wallet transactions
-
-A candidate notification marked `removed` is ignored. For each remaining notification, the bot fetches the receipt for that transaction hash and requires receipt status `0x1`. It then attempts `trace_transaction` and `debug_traceTransaction`, treating traces as optional, and extracts token candidates from the receipt and any available trace data.
+Only transactions sent to the Pons launch router with selector `0xf85f8e41` are decoded. The decoded `arg5` must be an active inventory entry, the receipt must succeed, and the first zero-address mint must not be a blocked base token.
 
 The HTTP RPC endpoint is used only for targeted lookups after filtered notifications: receipts, optional traces, deployed bytecode, and token metadata calls. The bot does not fetch blocks or scan unrelated transactions.
 
@@ -123,8 +103,7 @@ Do not place API keys, private keys, or credential-bearing files in source contr
 
 - WebSocket reconnects are automatic after a connection closes, and subscriptions are recreated on the new connection.
 - A subscription acknowledgement confirms provider acceptance; it does not by itself prove transaction delivery.
-- Candidate wallets are held in process memory and expire after `CANDIDATE_TTL_MS`; a periodic cleanup removes expired wallets from the active subscription. Reusing a wallet in a later successful `createBundle` registers it again with a fresh expiry. Candidates do not survive a process restart.
-- At most 1,000 candidate wallets are included in one candidate subscription refresh.
+- Candidate wallets are held in process memory and expire after `CANDIDATE_TTL_MS`. Candidates do not survive a process restart.
 - Receipt, bytecode, metadata, and trace calls depend on the configured HTTP provider. Trace support is optional; receipt evidence remains the primary analysis input.
 - The bot does not persist candidates or replay missed WebSocket notifications after a process restart.
 - `BUY_ENABLED=false` is the intended current mode. The bot detects launches but does not call GMGN.

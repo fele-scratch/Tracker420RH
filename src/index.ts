@@ -5,8 +5,8 @@ import WebSocket from "ws";
 import { CREATE_BUNDLE_SELECTOR, isSuccessfulReceipt, isCreateBundleTransaction } from "./detection.js";
 import { resolveBuySessionFlags } from "./buy-flags.js";
 import { buildGmgnUnsignedBuy } from "./gmgn-buy.js";
-import { firstMeaningfulInboundFrom, isActiveCandidate, isFundAmountInRange, weiToEth } from "./candidate-analysis.js";
-import { decodeLaunchAndBuyArgs, extractAddressCandidates, extractPonsLaunchTokenCandidates, extractTraceAddresses, extractZeroAddressMints, hasLaunchEvidence, selector } from "./launch-analysis.js";
+import { firstNonBlockedToken, isActiveCandidate, isFirstFundedByOkx, isFundAmountInRange, weiToEth } from "./candidate-analysis.js";
+import { decodeLaunchAndBuyArgs, extractZeroAddressMints, selector } from "./launch-analysis.js";
 
 const HTTP = must("RPC_HTTP_URL");
 const WS = must("RPC_WS_URL");
@@ -49,6 +49,10 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const FUND_ALERT_BOT_TOKEN = process.env.FUND_ALERT_BOT_TOKEN;
 const FUND_ALERT_CHAT_ID = process.env.FUND_ALERT_CHAT_ID;
+const BASE_TOKEN_BLOCKLIST = new Set([
+  "0x0000000000000000000000000000000000000000",
+  "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+]);
 
 type RpcResponse<T> = { result?: T; error?: { code: number; message: string } };
 type Tx = { hash: string; from: string; to: string | null; input: string; value?: string; blockNumber?: string; transactionIndex?: string };
@@ -58,7 +62,6 @@ type Candidate = { wallet: string; amountEth?: number; firstSeenAt: number; firs
 
 const candidates = new Map<string, Candidate>();
 const funderChecks = new Map<string, Promise<boolean>>();
-let refreshCandidateSubscriptions: (() => void) | null = null;
 let activeSocket: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let shuttingDown = false;
@@ -186,48 +189,25 @@ async function getReceipt(hash: string): Promise<Receipt> {
   return rpc<Receipt>("eth_getTransactionReceipt", [hash]);
 }
 
-async function wasFundedByOkx(recipient: string): Promise<boolean> {
+async function wasFundedByOkx(recipient: string, fundingTxHash: string): Promise<boolean> {
   const key = recipient.toLowerCase();
-  const cached = funderChecks.get(key);
+  const cacheKey = `${key}:${fundingTxHash.toLowerCase()}`;
+  const cached = funderChecks.get(cacheKey);
   if (cached) return cached;
   const check = (async () => {
     try {
-      const result = await rpc<{ transfers?: Array<{ from?: string; to?: string; value?: number; asset?: string }> }>("alchemy_getAssetTransfers", [{
+      const inbound = await rpc<{ transfers?: Array<{ from?: string; to?: string; value?: number; asset?: string; hash?: string }> }>("alchemy_getAssetTransfers", [{
         fromBlock: "0x0", toBlock: "latest", toAddress: key, category: ["external"], order: "asc", maxCount: "0x20",
       }]);
-      return firstMeaningfulInboundFrom(result.transfers ?? [], key) === OKX_FUNDER;
+      if (!isFirstFundedByOkx(inbound.transfers ?? [], key, OKX_FUNDER, fundingTxHash)) return false;
+      return (await rpc<string>("eth_getTransactionCount", [key, "latest"])) === "0x0";
     } catch (error) {
       log("FUNDER_CHECK_ERROR", { recipient: key, error: String(error) });
       return false;
     }
   })();
-  funderChecks.set(key, check);
+  funderChecks.set(cacheKey, check);
   return check;
-}
-
-async function validToken(token: string, trustedLaunchToken = false): Promise<boolean> {
-  const code = await rpc<string>("eth_getCode", [token, "latest"]);
-  if (code === "0x" || code.length <= 4) return false;
-  if (trustedLaunchToken) return true;
-  // A generic token candidate must expose at least one standard ERC-20 metadata/supply call.
-  const probes = ["0x06fdde03", "0x95d89b41", "0x18160ddd"];
-  let successes = 0;
-  for (const data of probes) {
-    try {
-      const result = await rpc<string>("eth_call", [{ to: token, data }, "latest"]);
-      if (result && result !== "0x") successes++;
-    } catch {}
-  }
-  return successes >= 1;
-}
-
-async function getTrace(hash: string): Promise<unknown | null> {
-  for (const method of ["trace_transaction", "debug_traceTransaction"]) {
-    try {
-      return await rpc<unknown>(method, method === "trace_transaction" ? [hash] : [hash, {}]);
-    } catch {}
-  }
-  return null;
 }
 
 function waitForBuyDelay(delayMs: number): Promise<void> {
@@ -260,7 +240,6 @@ function discoverCandidate(wallet: string, block: bigint, sourceTx: string, amou
     sourceTx,
   });
   log("CANDIDATE_WALLET", { wallet: key, firstSeenBlock: block.toString(), sourceTx });
-  refreshCandidateSubscriptions?.();
 }
 
 async function handleFunderTransaction(tx: Tx): Promise<void> {
@@ -269,7 +248,17 @@ async function handleFunderTransaction(tx: Tx): Promise<void> {
   const valueWei = BigInt(tx.value);
   const amountEth = weiToEth(valueWei);
   const passAmount = isFundAmountInRange(valueWei, MIN_FUND_ETH, MAX_FUND_ETH);
-  const passFirstFunding = await wasFundedByOkx(recipient);
+  if (!passAmount) {
+    log("FUNDER_TX", {
+      to: recipient,
+      valueEth: amountEth,
+      passAmount: false,
+      passFirstFunding: false,
+      reason: "amount-out-of-range",
+    });
+    return;
+  }
+  const passFirstFunding = await wasFundedByOkx(recipient, tx.hash);
   const reason = !passAmount ? "amount-out-of-range" : !passFirstFunding ? "not-first-funding" : "accepted";
   log("FUNDER_TX", { to: recipient, valueEth: amountEth, passAmount, passFirstFunding, reason });
   if (!passAmount || !passFirstFunding) return;
@@ -296,74 +285,6 @@ function pruneExpiredCandidates(): number {
   return removed;
 }
 
-async function inspectWalletTransaction(tx: Tx): Promise<void> {
-  const wallet = tx.from.toLowerCase();
-  const candidate = candidates.get(wallet);
-  if (!candidate || candidate.expiresAt < Date.now()) {
-    candidates.delete(wallet);
-    return;
-  }
-
-  const receipt = await getReceipt(tx.hash);
-  if (receipt.status !== "0x1") return;
-
-  const trace = await getTrace(tx.hash);
-  const zeroMintTokens = extractZeroAddressMints(receipt);
-  const ponsEventTokens = extractPonsLaunchTokenCandidates(receipt);
-  const receiptCandidates = extractAddressCandidates(receipt);
-  const traceCandidates = extractTraceAddresses(trace as never);
-  const tokenCandidates = [...new Set([...zeroMintTokens, ...ponsEventTokens, ...receiptCandidates, ...traceCandidates])];
-  const method = selector(tx.input);
-  const launchSelectors = new Set(["0x3c05c981", "0x70237117", "0x916d099c", "0xf85f8e41"]);
-  if (!hasLaunchEvidence(receipt, trace as never, { destination: tx.to, inputSelector: method, mothership: MOTHERSHIP, launchSelectors })) return;
-
-  const validTokens: string[] = [];
-  for (const token of tokenCandidates) {
-    if (await validToken(token, ponsEventTokens.includes(token) || zeroMintTokens.includes(token))) validTokens.push(token);
-  }
-  if (validTokens.length === 0) return;
-  const tokenCA = validTokens.find((token) => zeroMintTokens.includes(token) || ponsEventTokens.includes(token));
-
-  let buyPlan: Record<string, unknown> | undefined;
-  if (BUY_PLAN && BUY_RECIPIENT) {
-    if (!tokenCA) {
-      log("BUY_PLAN_UNAVAILABLE", { reason: "launch receipt did not expose a validated token", launchTx: tx.hash });
-    } else {
-      try {
-        buyPlan = await prepareBuyPlan(tokenCA, tx);
-      } catch (error) {
-        log("BUY_PLAN_UNAVAILABLE", { reason: String(error), launchTx: tx.hash, tokenAddress: tokenCA });
-      }
-    }
-  }
-
-  log("LAUNCH_DETECTED", {
-    wallet,
-    sourcePreparationTx: candidate.sourceTx,
-    launchTx: tx.hash,
-    launchTo: tx.to,
-    method,
-    blockNumber: tx.blockNumber,
-    transactionIndex: tx.transactionIndex,
-    mintedTokens: validTokens,
-    detectionEvidence: {
-      zeroAddressMintTokens: zeroMintTokens,
-      ponsEventTokenCandidates: ponsEventTokens,
-      receiptAddressCandidates: receiptCandidates,
-      traceAddressCandidates: traceCandidates,
-      traceAvailable: trace !== null,
-    },
-    buyEnabled: BUY_PLAN,
-    buyPlan,
-    action: BUY_EXECUTE ? "EXECUTION_ENABLED" : "DRY_RUN_ONLY",
-  });
-  if (tokenCA) await notifyLaunch(tokenCA, wallet, tx.hash);
-
-  // Deliberately no trading call here. The execution adapter must be reviewed and configured separately.
-  candidates.delete(wallet);
-  refreshCandidateSubscriptions?.();
-}
-
 async function handleMothershipTransaction(tx: Tx): Promise<void> {
   if (!isCreateBundleTransaction(tx, MOTHERSHIP) || !tx.blockNumber) return;
   const receipt = await getReceipt(tx.hash);
@@ -385,7 +306,7 @@ async function handlePonsLaunchTransaction(tx: Tx): Promise<void> {
   const receipt = await getReceipt(tx.hash);
   if (!isSuccessfulReceipt(receipt)) return;
   const zeroMintTokens = extractZeroAddressMints(receipt);
-  const tokenAddress = zeroMintTokens[0];
+  const tokenAddress = firstNonBlockedToken(zeroMintTokens, BASE_TOKEN_BLOCKLIST);
   if (!tokenAddress) return;
   let buyPlan: Record<string, unknown> | undefined;
   if (BUY_PLAN && BUY_RECIPIENT) {
@@ -418,8 +339,6 @@ function connect(): void {
   activeSocket = socket;
   let nextId = 1;
   let socketReady = false;
-  let candidateMiningSubscriptionId: string | null = null;
-  let candidateMiningRequestId: number | null = null;
   let mothershipMiningSubscriptionId: string | null = null;
   let mothershipMiningRequestId: number | null = null;
   let ponsLaunchMiningSubscriptionId: string | null = null;
@@ -427,38 +346,10 @@ function connect(): void {
   let funderMiningSubscriptionId: string | null = null;
   let funderMiningRequestId: number | null = null;
 
-  const syncCandidateMiningSubscription = (): void => {
-    if (!socketReady) return;
-    pruneExpiredCandidates();
-    const wallets = [...candidates.keys()];
-    if (wallets.length === 0) {
-      if (candidateMiningSubscriptionId) {
-        socket.send(JSON.stringify({ jsonrpc: "2.0", id: nextId++, method: "eth_unsubscribe", params: [candidateMiningSubscriptionId] }));
-        candidateMiningSubscriptionId = null;
-      }
-      return;
-    }
-    if (wallets.length > 1000) {
-      log("CANDIDATE_LIMIT", { count: wallets.length, limit: 1000 });
-    }
-    if (candidateMiningSubscriptionId) {
-      socket.send(JSON.stringify({ jsonrpc: "2.0", id: nextId++, method: "eth_unsubscribe", params: [candidateMiningSubscriptionId] }));
-      candidateMiningSubscriptionId = null;
-    }
-    const addresses = wallets.slice(0, 1000).map((from) => ({ from }));
-    candidateMiningRequestId = nextId++;
-    socket.send(JSON.stringify({
-      jsonrpc: "2.0",
-      id: candidateMiningRequestId,
-      method: "eth_subscribe",
-      params: ["alchemy_minedTransactions", { addresses, includeRemoved: false, hashesOnly: false }],
-    }));
-    log("CANDIDATE_WALLET_SUBSCRIPTION_REFRESHED", { count: addresses.length });
-  };
-
   socket.on("open", () => {
     socketReady = true;
     log("WS_CONNECTED", { endpoint: safeEndpoint(WS) });
+    log("LAUNCH_GATE", { rule: "router+0xf85f8e41+inventory" });
     log("ROUTER_SUBSCRIBED", { to: PONS_LAUNCH_ROUTER, selector: LAUNCH_SELECTOR });
     ponsLaunchMiningRequestId = nextId++;
     socket.send(JSON.stringify({
@@ -496,8 +387,6 @@ function connect(): void {
         }],
       }));
     }
-    refreshCandidateSubscriptions = syncCandidateMiningSubscription;
-    syncCandidateMiningSubscription();
   });
 
   socket.on("message", async (raw) => {
@@ -513,15 +402,13 @@ function connect(): void {
         return;
       }
       if (message.id && typeof message.result === "string") {
-        if (message.id === candidateMiningRequestId) candidateMiningSubscriptionId = message.result;
         if (message.id === mothershipMiningRequestId) mothershipMiningSubscriptionId = message.result;
         if (message.id === ponsLaunchMiningRequestId) ponsLaunchMiningSubscriptionId = message.result;
         if (message.id === funderMiningRequestId) funderMiningSubscriptionId = message.result;
         log("WS_SUBSCRIPTION_ACCEPTED", {
           requestId: message.id,
           subscription: message.result,
-          stream: message.id === candidateMiningRequestId ? "candidate-wallets" :
-            message.id === mothershipMiningRequestId ? "mothership-to-filter" :
+          stream: message.id === mothershipMiningRequestId ? "mothership-to-filter" :
               message.id === ponsLaunchMiningRequestId ? "pons-launch-router" :
                 message.id === funderMiningRequestId ? "okx-funder-from-filter" : "other",
         });
@@ -537,9 +424,6 @@ function connect(): void {
         if (!mined.removed) await handleFunderTransaction(mined.transaction);
       } else if (message.params?.subscription === mothershipMiningSubscriptionId) {
         await handleMothershipTransaction(result as unknown as Tx);
-      } else if ("transaction" in result) {
-        const mined = result as { removed: boolean; transaction: Tx };
-        if (!mined.removed) await inspectWalletTransaction(mined.transaction);
       }
     } catch (error) {
       log("WS_MESSAGE_ERROR", { error: String(error) });
@@ -549,8 +433,6 @@ function connect(): void {
   socket.on("error", (error) => log("WS_ERROR", { error: String(error) }));
   socket.on("close", () => {
     socketReady = false;
-    candidateMiningSubscriptionId = null;
-    candidateMiningRequestId = null;
     mothershipMiningSubscriptionId = null;
     mothershipMiningRequestId = null;
     ponsLaunchMiningSubscriptionId = null;
@@ -575,7 +457,6 @@ function shutdown(signal: string): void {
   shuttingDown = true;
   if (reconnectTimer !== null) clearTimeout(reconnectTimer);
   reconnectTimer = null;
-  refreshCandidateSubscriptions = null;
   log("SHUTTING_DOWN", { signal, candidates: candidates.size });
   if (activeSocket) {
     activeSocket.close(1000, "shutdown");
@@ -587,7 +468,7 @@ process.once("SIGINT", () => shutdown("SIGINT"));
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 
 const candidateCleanupTimer = setInterval(() => {
-  if (pruneExpiredCandidates() > 0) refreshCandidateSubscriptions?.();
+  pruneExpiredCandidates();
 }, Math.min(CANDIDATE_TTL_MS, 60_000));
 candidateCleanupTimer.unref();
 
@@ -598,7 +479,7 @@ log("STARTING", {
   candidateTrigger: `createBundle(${CREATE_BUNDLE_SELECTOR}) sent to mothership`,
   buyEnabled: BUY_ENABLED,
   mode: BUY_ENABLED ? "live execution" : "dry-run detection",
-  candidateMonitoring: "Alchemy alchemy_minedTransactions address-filtered WebSocket",
+  candidateMonitoring: "disabled; inventory is checked only at the Pons router",
   mothershipMonitoring: MOTHERSHIP_DISCOVERY_ENABLED ? "Alchemy alchemy_minedTransactions to-filtered WebSocket" : "disabled",
   ponsLaunchMonitoring: "Alchemy alchemy_minedTransactions to-filtered WebSocket with calldata prefilter",
 });
